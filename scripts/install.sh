@@ -13,5 +13,6 @@ python3 -m venv "${WORKSPACE_DIR}/venvs/webui"
 "${WORKSPACE_DIR}/venvs/webui/bin/python" -m pip install -U pip setuptools wheel
 "${WORKSPACE_DIR}/venvs/webui/bin/pip" install open-webui --no-cache-dir
 
-echo "Install complete."
+"${WORKSPACE_DIR}/venvs/webui/bin/python" "${SCRIPT_DIR}/patch-openwebui-default-model-tools.py"
 
+echo "Install complete."

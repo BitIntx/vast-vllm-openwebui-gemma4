@@ -1,16 +1,20 @@
 # Vast OpenWebUI vLLM Toolkit
 
-Vast.ai에서 Open WebUI + vLLM을 빠르게 띄우고, Qwen/Gemma 계열 모델에 웹 검색, 웹페이지 읽기, 이미지/영상 inspection, 로컬 미디어 URL 도구를 붙이기 위한 개인용 실행 메모입니다. 나만 쓰려고 만든 거라 따라 쓰든 말든 실행은 보장하지 않습니다. 환경, 드라이버, vLLM 버전, 모델 repo 상태에 따라 그냥 깨질 수 있습니다.
+[한국어 README](./README.ko.md)
 
-테스트한 기준:
+Personal quickstart notes for running Open WebUI + vLLM on Vast.ai with Qwen/Gemma-style models and practical OpenAPI tools: web search, webpage reading, image inspection, direct video inspection, media URL resolution, and a local media server for video files.
+
+This repository is not a polished product. It is a personal setup log. Use it if it helps, but there is no guarantee that it will work on your machine, driver, CUDA stack, vLLM version, model repo, or Vast image.
+
+Tested setup:
 
 - Vast.ai container
 - NVIDIA RTX PRO 5000 Blackwell
-- CUDA 13.x
+- CUDA 13.x environment
 - vLLM 0.23.0
 - Open WebUI
-- Gemma4 NVFP4 계열 모델
-- Qwen3.6 NVFP4 계열 모델도 별도 스크립트로 간단 테스트
+- Gemma4 NVFP4-family model
+- Qwen3.6 NVFP4-family model variant
 
 ## 1. Clone
 
@@ -20,7 +24,7 @@ cd vast-openwebui-vllm-toolkit
 cp .env.example .env
 ```
 
-필요하면 `.env`에서 모델명, 컨텍스트 길이, KV cache dtype을 바꿉니다.
+Edit `.env` if you want a different model, context length, KV cache dtype, or local paths.
 
 ## 2. Install
 
@@ -28,7 +32,7 @@ cp .env.example .env
 bash scripts/install.sh
 ```
 
-기본 설치 경로:
+Default paths:
 
 ```text
 /workspace/venvs/vllm
@@ -38,29 +42,29 @@ bash scripts/install.sh
 /workspace/open-webui-data
 ```
 
-주의: Vast에서 `/workspace`가 persistent volume이 아닐 수 있습니다.
+On Vast.ai, `/workspace` is not always persistent. Check before storing anything important there:
 
 ```bash
 vast-capabilities | jq '.instance.workspace_is_volume'
 ```
 
-`false`면 instance recycle/destroy 때 전부 날아갑니다.
+If this returns `false`, recycle/destroy can wipe the instance filesystem.
 
 ## 3. Start vLLM
 
-기존 테스트 서비스가 있으면 먼저 내립니다.
+Stop any old test service first:
 
 ```bash
 supervisorctl stop vllm-openai 2>/dev/null || true
 ```
 
-vLLM 실행:
+Start the Gemma4 variant:
 
 ```bash
 bash scripts/run-vllm-gemma4.sh
 ```
 
-기본 옵션:
+Default settings:
 
 ```text
 model: AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4
@@ -73,35 +77,35 @@ reasoning parser: gemma4
 tool call parser: gemma4
 ```
 
-Gemma4 thinking 분리에 필요한 핵심 옵션:
+Gemma4 thinking/reasoning separation:
 
 ```bash
 --default-chat-template-kwargs '{"enable_thinking":true}'
 --reasoning-parser gemma4
 ```
 
-Open WebUI의 native tool calling을 쓰려면 이것도 필요합니다.
+Native Open WebUI tool calling also needs:
 
 ```bash
 --tool-call-parser gemma4
 --enable-auto-tool-choice
 ```
 
-### Qwen3.6 NVFP4 test variant
+### Qwen3.6 NVFP4 Variant
 
-Gemma4 설정은 그대로 두고 Qwen3.6 계열 모델만 빠르게 테스트하려면:
+To test the Qwen3.6-family model with the same general setup:
 
 ```bash
 bash scripts/run-vllm-qwen36.sh
 ```
 
-기본 모델:
+Default model:
 
 ```text
 lyf/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-NVFP4
 ```
 
-Gemma4와 다른 핵심 parser 옵션:
+Key parser differences:
 
 ```bash
 --reasoning-parser qwen3
@@ -109,7 +113,7 @@ Gemma4와 다른 핵심 parser 옵션:
 --enable-auto-tool-choice
 ```
 
-테스트 당시 `tool_choice: "auto"` 요청에서 vLLM 응답이 아래처럼 구조화된 `tool_calls`를 반환했습니다.
+During testing, vLLM returned structured `tool_calls` with `tool_choice: "auto"`:
 
 ```json
 {
@@ -130,49 +134,35 @@ Gemma4와 다른 핵심 parser 옵션:
 }
 ```
 
-Open WebUI에서 이 모델로 tool을 자동 선택하게 하려면 모델 설정에서 Function Calling을 `Native`로 두고 도구를 켜야 합니다. 이 레포의 기본 자동 도구 메타 설정은 환경에 따라 특정 모델 ID에만 붙어 있을 수 있습니다.
-
-Gemma4와 Qwen3.6 모델에 `Web + Image + Video Tools`를 기본 활성화하려면 Open WebUI DB에 model metadata를 넣습니다.
+To make Open WebUI auto-use tools for these models, set Function Calling to `Native` and enable the tool server. This helper writes model metadata for the tested Gemma4 and Qwen3.6 model IDs:
 
 ```bash
 python3 scripts/enable-openwebui-model-tools.py
+python3 scripts/patch-openwebui-default-model-tools.py
 supervisorctl restart open-webui-vllm
 ```
 
+The patch script adds a small Open WebUI backend fallback: if a chat request has no explicit `tool_ids`, Open WebUI uses the selected model's `meta.toolIds`. The UI toggle may still look unchecked, but the model-attached tools are available to the request.
+
 ## 4. Start Open WebUI
 
-새 터미널에서:
+In another terminal:
 
 ```bash
 cd vast-openwebui-vllm-toolkit
 bash scripts/run-openwebui.sh
 ```
 
-Open WebUI는 기본적으로 내부 vLLM에 붙습니다.
+Open WebUI points to the local vLLM endpoint by default:
 
 ```text
 OPENAI_API_BASE_URL=http://127.0.0.1:8000/v1
 OPENAI_API_KEY=sk-test
 ```
 
-## 5. Optional Web + Image + Video Tools
+## 5. Web + Image + Video Tools
 
-웹 검색, 웹페이지 읽기, 이미지 검색, 미디어 URL 해석, 이미지 URL inspection, 직접 영상 URL inspection용 OpenAPI tool server를 같이 넣어뒀습니다.
-
-새 터미널에서:
-
-```bash
-cd vast-openwebui-vllm-toolkit
-bash scripts/run-openwebui-web-tools.sh
-```
-
-기본 tool server 주소:
-
-```text
-http://127.0.0.1:17071/openapi.json
-```
-
-포함된 도구:
+This repository includes a local OpenAPI tool server for:
 
 ```text
 search_web
@@ -183,63 +173,78 @@ inspect_image
 inspect_video
 ```
 
-`.env.example`에는 Open WebUI backend가 시작할 때 이 tool server를 global tool server로 읽도록 `TOOL_SERVER_CONNECTIONS`를 넣어뒀습니다. Open WebUI를 이미 켠 상태에서 `.env`를 바꿨다면 Open WebUI를 재시작하세요.
+Start it:
+
+```bash
+cd vast-openwebui-vllm-toolkit
+bash scripts/run-openwebui-web-tools.sh
+```
+
+OpenAPI URL:
+
+```text
+http://127.0.0.1:17071/openapi.json
+```
+
+`.env.example` includes `TOOL_SERVER_CONNECTIONS` so Open WebUI backend can register this tool server automatically. Restart Open WebUI after changing `.env`:
 
 ```bash
 supervisorctl restart open-webui-vllm
 ```
 
-또는 직접 실행 중이면 `scripts/run-openwebui.sh`를 다시 실행합니다.
+Do not add `http://127.0.0.1:17071` from a remote browser UI when using a Cloudflare URL unless you know how Open WebUI resolves tool servers. In many setups, browser-side `127.0.0.1` means your local device, not the Vast container. This repo uses backend-side `TOOL_SERVER_CONNECTIONS` for that reason.
 
-중요: Cloudflare URL로 Open WebUI에 접속 중일 때 사용자 화면의 tool server 연결에 `http://127.0.0.1:17071`을 넣으면, 그 `127.0.0.1`은 Vast 컨테이너가 아니라 접속한 브라우저 기기의 localhost일 수 있습니다. 이 레포는 그래서 UI에 직접 넣는 방식보다 `TOOL_SERVER_CONNECTIONS`로 backend에 주입하는 방식을 기본값으로 둡니다.
+Open WebUI checklist:
 
-Open WebUI에서 확인할 것:
+- Set model Function Calling to `Native`
+- Enable `Web + Image + Video Tools` or the individual tools in the chat UI
 
-- 모델 설정에서 Function Calling을 `Native`로 설정
-- 채팅 입력창의 도구 목록에서 `Web + Image + Video Tools` 또는 필요한 개별 도구 활성화
-
-테스트 프롬프트:
+Example prompts:
 
 ```text
-search_web 도구를 사용해서 "Open WebUI OpenAPI tool server"를 검색하고 상위 3개 결과 URL을 보여줘.
+Use search_web to search for "Open WebUI OpenAPI tool server" and show the top 3 result URLs.
 ```
 
 ```text
-read_webpage 도구로 https://github.com/open-webui/openapi-servers 페이지를 읽고 핵심만 요약해줘.
+Use read_webpage to read https://github.com/open-webui/openapi-servers and summarize the key points.
 ```
 
 ```text
-search_images 도구로 "RTX PRO 5000 Blackwell" 이미지를 찾고, 첫 번째 이미지 URL을 inspect_image 도구로 분석해서 한국어로 설명해줘.
+Use search_images to find "RTX PRO 5000 Blackwell", then inspect the first image URL with inspect_image.
 ```
 
-페이지에서 직접 미디어 URL 후보를 찾고 싶을 때:
+For media URL discovery:
 
 ```text
-resolve_media_url 도구로 https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4 의 video URL을 확인해줘.
+Use resolve_media_url on https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4 and report the video URL.
 ```
 
-`resolve_media_url`은 파일 형식과 직접 URL 후보만 확인합니다. 영상 내용을 실제로 보려면 이어서 `inspect_video`를 호출해야 합니다.
+`resolve_media_url` only verifies direct media URLs or finds simple HTML media candidates. It does not inspect or play video. To understand video content, call `inspect_video` after it returns a `resolved_url`.
 
-직접 mp4/webm URL이 있을 때:
+For direct video inspection:
 
 ```text
-inspect_video 도구로 https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4 영상을 보고 한국어로 한 문장으로 설명해줘.
+Use inspect_video on https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4 and describe it in one sentence.
 ```
 
-주의: `resolve_media_url`은 직접 파일 URL과 HTML에 노출된 `<video>`, `<source>`, `og:video`, `og:image` 같은 단순 후보만 찾습니다. `inspect_video`는 직접 접근 가능한 `mp4`, `webm`, `mov`, `m4v` 파일 URL만 처리합니다. YouTube/TikTok/X 같은 JavaScript 플레이어 페이지에서 영상을 다운로드하거나 프레임을 추출하는 기능은 넣지 않았습니다.
+Limitations:
 
-선택 API 키:
+- `resolve_media_url` handles direct file URLs and simple HTML tags such as `<video>`, `<source>`, `og:video`, and `og:image`.
+- `inspect_video` expects direct video URLs such as `mp4`, `webm`, `mov`, or `m4v`.
+- It does not download YouTube/TikTok/X videos or run JavaScript-heavy players.
+
+Optional search API keys:
 
 ```bash
 BRAVE_SEARCH_API_KEY=...
 TAVILY_API_KEY=...
 ```
 
-키가 없으면 DuckDuckGo fallback으로 시도합니다.
+Without keys, the search tools try DuckDuckGo fallbacks.
 
 ## 6. Local Media Server for Video URLs
 
-Open WebUI의 파일 업로드가 vLLM `video_url`로 잘 전달되지 않을 때는 같은 컨테이너 안의 로컬 HTTP 서버로 우회할 수 있습니다. 기본 공개 폴더는 `/workspace/media`이고 외부에는 노출하지 않도록 `127.0.0.1:9000`에만 바인딩합니다.
+If Open WebUI uploads do not reach vLLM as `video_url`, serve local files over an internal HTTP server. The default directory is `/workspace/media`, bound only to `127.0.0.1:9000`.
 
 ```bash
 mkdir -p /workspace/media
@@ -249,21 +254,21 @@ cd vast-openwebui-vllm-toolkit
 bash scripts/run-local-media-server.sh
 ```
 
-Open WebUI에서는 도구를 켠 뒤 이렇게 물어봅니다.
+Ask Open WebUI:
 
 ```text
-inspect_video 도구로 http://127.0.0.1:9000/me.mp4 영상을 보고 장면을 설명해줘.
+Use inspect_video on http://127.0.0.1:9000/me.mp4 and describe the scene.
 ```
 
-모델이 URL 확인만 하고 멈추면 아래처럼 명시합니다.
+If the model only verifies the URL and stops, be explicit:
 
 ```text
-resolve_media_url로 확인한 뒤, resolved_url을 inspect_video 도구에 넘겨서 영상 내용을 실제로 분석해줘.
+Resolve the media URL if needed, then pass resolved_url to inspect_video and actually analyze the video content.
 ```
 
-이 `127.0.0.1`은 사용자의 브라우저 기기가 아니라 Vast 컨테이너 내부에서 tool server와 vLLM이 접근하는 주소입니다. 파일명에 공백이 있으면 URL 인코딩을 쓰거나 파일명을 단순하게 바꾸는 편이 낫습니다.
+This `127.0.0.1` is meant for the Vast container where the tool server and vLLM run, not for the user's browser device. Simple ASCII filenames are recommended.
 
-환경 변수:
+Environment variables:
 
 ```bash
 LOCAL_MEDIA_HOST=127.0.0.1
@@ -273,14 +278,14 @@ LOCAL_MEDIA_DIR=/workspace/media
 
 ## 7. Cloudflare Quick Tunnel
 
-새 터미널에서:
+In another terminal:
 
 ```bash
 cd vast-openwebui-vllm-toolkit
 bash scripts/run-cloudflare.sh
 ```
 
-로그에 나오는 `https://*.trycloudflare.com` 주소로 접속합니다. Quick tunnel은 임시 주소라 재시작하면 바뀔 수 있습니다.
+Use the `https://*.trycloudflare.com` URL printed in the logs. Quick tunnel URLs are temporary and can change after restart.
 
 ## 8. API Smoke Test
 
@@ -290,34 +295,34 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4",
-    "messages": [{"role": "user", "content": "안녕"}],
+    "messages": [{"role": "user", "content": "hello"}],
     "max_tokens": 512,
     "temperature": 0
   }'
 ```
 
-`--reasoning-parser gemma4`가 잘 먹으면 thinking은 `message.reasoning` 쪽으로 분리됩니다.
+If `--reasoning-parser gemma4` is active, thinking should appear in `message.reasoning` instead of being mixed into `message.content`.
 
-## 8. Heavier Settings
+## 9. Heavier Settings
 
-BF16 KV cache를 시도하려면 `.env`에서:
+To try BF16 KV cache, edit `.env`:
 
 ```bash
 SERVE_KV_CACHE_DTYPE=bfloat16
 ```
 
-비디오 frame/해상도를 제한하고 싶으면 `SERVE_MM_LIMIT`를 더 구체적으로 바꿉니다.
+To constrain video frames/resolution, use a more specific multimodal limit:
 
 ```bash
 SERVE_MM_LIMIT={"image":4,"video":{"count":1,"num_frames":16,"width":512,"height":512}}
 ```
 
-## 9. No Warranty
+## 10. No Warranty
 
-이 레포는 제품이 아니고 개인용 실행 메모입니다.
+This is a personal setup note, not a product.
 
-- 실행 보장 없음
-- 성능 보장 없음
-- 모델 품질 보장 없음
-- 보안 구성 보장 없음
-- 비용 폭탄 책임 안 짐
+- No runtime guarantee
+- No performance guarantee
+- No model quality guarantee
+- No security guarantee
+- No cost-safety guarantee
