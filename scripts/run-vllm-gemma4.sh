@@ -22,7 +22,7 @@ exec vllm serve "${MODEL}" \
   --gpu-memory-utilization "${SERVE_GPU_MEMORY_FRACTION:-0.90}" \
   --max-model-len "${SERVE_CONTEXT_LENGTH:-256K}" \
   --max-num-batched-tokens "${SERVE_BATCHED_TOKENS:-32768}" \
-  --limit-mm-per-prompt "${SERVE_MM_LIMIT:-{\"image\":4,\"video\":1}}" \
+  --limit-mm-per-prompt "${SERVE_MM_LIMIT:-{\"image\":8,\"video\":1}}" \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
   --reasoning-parser gemma4 \
   --tool-call-parser gemma4 \

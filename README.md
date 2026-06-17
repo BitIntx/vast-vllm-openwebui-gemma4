@@ -71,7 +71,7 @@ model: AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4
 context: 256K
 weights dtype: bfloat16
 KV cache dtype: fp8
-multimodal limit: image 4, video 1
+multimodal limit: image 8, video 1
 thinking: enabled
 reasoning parser: gemma4
 tool call parser: gemma4
@@ -314,7 +314,7 @@ SERVE_KV_CACHE_DTYPE=bfloat16
 To constrain video frames/resolution, use a more specific multimodal limit:
 
 ```bash
-SERVE_MM_LIMIT={"image":4,"video":{"count":1,"num_frames":16,"width":512,"height":512}}
+SERVE_MM_LIMIT={"image":8,"video":{"count":1,"num_frames":16,"width":512,"height":512}}
 ```
 
 ## 10. No Warranty
