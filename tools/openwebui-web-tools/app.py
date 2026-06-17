@@ -62,7 +62,7 @@ class ResolveMediaUrlRequest(BaseModel):
 class InspectImageRequest(BaseModel):
     image_url: str = Field(..., description="Public image URL to inspect.")
     question: str = Field("Describe this image and answer any relevant question.", description="Question for the vision model.")
-    model: str | None = Field(None, description="vLLM served model name. Defaults to SERVE_MODEL env or Gemma4.")
+    model: str | None = Field(None, description="vLLM served model name. Defaults to the currently served model from /v1/models.")
     max_tokens: int = Field(768, ge=64, le=4096, description="Maximum completion tokens.")
     enable_thinking: bool = Field(True, description="Whether to enable Gemma4 thinking for this image inspection call.")
 
@@ -76,7 +76,7 @@ class InspectVideoRequest(BaseModel):
         ),
     )
     question: str = Field("Describe this video and answer any relevant question.", description="Question for the vision model.")
-    model: str | None = Field(None, description="vLLM served model name. Defaults to SERVE_MODEL env or Gemma4.")
+    model: str | None = Field(None, description="vLLM served model name. Defaults to the currently served model from /v1/models.")
     max_tokens: int = Field(2048, ge=64, le=8192, description="Maximum completion tokens.")
     enable_thinking: bool = Field(False, description="Whether to enable Gemma4 thinking for this video inspection call.")
 
@@ -92,6 +92,38 @@ def _client() -> httpx.AsyncClient:
             )
         },
     )
+
+
+async def _resolve_vllm_model(requested_model: str | None, base_url: str, api_key: str) -> str:
+    if requested_model:
+        return requested_model
+
+    configured_model = os.getenv("SERVE_MODEL") or DEFAULT_MODEL
+    try:
+        async with _client() as client:
+            res = await client.get(
+                f"{base_url}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            res.raise_for_status()
+        model_ids = [item.get("id") for item in res.json().get("data", []) if item.get("id")]
+    except Exception:
+        return configured_model
+
+    if configured_model in model_ids:
+        return configured_model
+    if model_ids:
+        return model_ids[0]
+    return configured_model
+
+
+def _vllm_error_detail(prefix: str, exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = exc.response.text.strip()
+        if len(body) > 800:
+            body = body[:800] + "...[truncated]"
+        return f"{prefix}: HTTP {exc.response.status_code}: {body}"
+    return f"{prefix}: {exc}"
 
 
 class _ReadableHTMLParser(HTMLParser):
@@ -650,7 +682,7 @@ async def inspect_image(req: InspectImageRequest) -> dict[str, Any]:
     """Inspect a public image URL with the local vLLM vision model."""
     base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
     api_key = os.getenv("VLLM_API_KEY", "sk-test")
-    model = req.model or os.getenv("SERVE_MODEL") or DEFAULT_MODEL
+    model = await _resolve_vllm_model(req.model, base_url, api_key)
     payload = {
         "model": model,
         "messages": [
@@ -676,7 +708,7 @@ async def inspect_image(req: InspectImageRequest) -> dict[str, Any]:
             )
             res.raise_for_status()
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"vLLM image inspection failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=_vllm_error_detail("vLLM image inspection failed", exc)) from exc
     data = res.json()
     message = data.get("choices", [{}])[0].get("message", {})
     return {
@@ -695,7 +727,7 @@ async def inspect_video(req: InspectVideoRequest) -> dict[str, Any]:
     video_metadata = await _validate_direct_video_url(req.video_url)
     base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
     api_key = os.getenv("VLLM_API_KEY", "sk-test")
-    model = req.model or os.getenv("SERVE_MODEL") or DEFAULT_MODEL
+    model = await _resolve_vllm_model(req.model, base_url, api_key)
     payload = {
         "model": model,
         "messages": [
@@ -721,7 +753,7 @@ async def inspect_video(req: InspectVideoRequest) -> dict[str, Any]:
             )
             res.raise_for_status()
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"vLLM video inspection failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=_vllm_error_detail("vLLM video inspection failed", exc)) from exc
     data = res.json()
     message = data.get("choices", [{}])[0].get("message", {})
     return {
