@@ -25,7 +25,7 @@ exec vllm serve "${MODEL}" \
   --limit-mm-per-prompt "${SERVE_MM_LIMIT:-{\"image\":4,\"video\":1}}" \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
   --reasoning-parser gemma4 \
+  --tool-call-parser gemma4 \
   --trust-remote-code \
   --enforce-eager \
   --api-key "${SERVE_API_KEY:-sk-test}"
-

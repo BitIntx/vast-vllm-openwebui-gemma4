@@ -69,6 +69,7 @@ KV cache dtype: fp8
 multimodal limit: image 4, video 1
 thinking: enabled
 reasoning parser: gemma4
+tool call parser: gemma4
 ```
 
 Gemma4 thinking 분리에 필요한 핵심 옵션:
@@ -76,6 +77,12 @@ Gemma4 thinking 분리에 필요한 핵심 옵션:
 ```bash
 --default-chat-template-kwargs '{"enable_thinking":true}'
 --reasoning-parser gemma4
+```
+
+Open WebUI의 native tool calling을 쓰려면 이것도 필요합니다.
+
+```bash
+--tool-call-parser gemma4
 ```
 
 ## 4. Start Open WebUI
@@ -94,7 +101,66 @@ OPENAI_API_BASE_URL=http://127.0.0.1:8000/v1
 OPENAI_API_KEY=sk-test
 ```
 
-## 5. Cloudflare Quick Tunnel
+## 5. Optional Web + Image Tools
+
+웹 검색, 이미지 검색, 이미지 URL inspection용 OpenAPI tool server를 같이 넣어뒀습니다.
+
+새 터미널에서:
+
+```bash
+cd vast-vllm-openwebui-gemma4
+bash scripts/run-openwebui-web-tools.sh
+```
+
+기본 tool server 주소:
+
+```text
+http://127.0.0.1:17071/openapi.json
+```
+
+포함된 도구:
+
+```text
+search_web
+search_images
+inspect_image
+```
+
+`.env.example`에는 Open WebUI backend가 시작할 때 이 tool server를 global tool server로 읽도록 `TOOL_SERVER_CONNECTIONS`를 넣어뒀습니다. Open WebUI를 이미 켠 상태에서 `.env`를 바꿨다면 Open WebUI를 재시작하세요.
+
+```bash
+supervisorctl restart open-webui-vllm
+```
+
+또는 직접 실행 중이면 `scripts/run-openwebui.sh`를 다시 실행합니다.
+
+중요: Cloudflare URL로 Open WebUI에 접속 중일 때 사용자 화면의 tool server 연결에 `http://127.0.0.1:17071`을 넣으면, 그 `127.0.0.1`은 Vast 컨테이너가 아니라 접속한 브라우저 기기의 localhost일 수 있습니다. 이 레포는 그래서 UI에 직접 넣는 방식보다 `TOOL_SERVER_CONNECTIONS`로 backend에 주입하는 방식을 기본값으로 둡니다.
+
+Open WebUI에서 확인할 것:
+
+- 모델 설정에서 Function Calling을 `Native`로 설정
+- 채팅 입력창의 도구 목록에서 `Web + Image Tools` 또는 `search_web`, `search_images`, `inspect_image` 활성화
+
+테스트 프롬프트:
+
+```text
+search_web 도구를 사용해서 "Open WebUI OpenAPI tool server"를 검색하고 상위 3개 결과 URL을 보여줘.
+```
+
+```text
+search_images 도구로 "RTX PRO 5000 Blackwell" 이미지를 찾고, 첫 번째 이미지 URL을 inspect_image 도구로 분석해서 한국어로 설명해줘.
+```
+
+선택 API 키:
+
+```bash
+BRAVE_SEARCH_API_KEY=...
+TAVILY_API_KEY=...
+```
+
+키가 없으면 DuckDuckGo fallback으로 시도합니다.
+
+## 6. Cloudflare Quick Tunnel
 
 새 터미널에서:
 
@@ -105,7 +171,7 @@ bash scripts/run-cloudflare.sh
 
 로그에 나오는 `https://*.trycloudflare.com` 주소로 접속합니다. Quick tunnel은 임시 주소라 재시작하면 바뀔 수 있습니다.
 
-## 6. API Smoke Test
+## 7. API Smoke Test
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -121,7 +187,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 `--reasoning-parser gemma4`가 잘 먹으면 thinking은 `message.reasoning` 쪽으로 분리됩니다.
 
-## 7. Heavier Settings
+## 8. Heavier Settings
 
 BF16 KV cache를 시도하려면 `.env`에서:
 
@@ -135,7 +201,7 @@ SERVE_KV_CACHE_DTYPE=bfloat16
 SERVE_MM_LIMIT={"image":4,"video":{"count":1,"num_frames":16,"width":512,"height":512}}
 ```
 
-## 8. No Warranty
+## 9. No Warranty
 
 이 레포는 제품이 아니고 개인용 실행 메모입니다.
 
@@ -144,4 +210,3 @@ SERVE_MM_LIMIT={"image":4,"video":{"count":1,"num_frames":16,"width":512,"height
 - 모델 품질 보장 없음
 - 보안 구성 보장 없음
 - 비용 폭탄 책임 안 짐
-
