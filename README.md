@@ -218,6 +218,8 @@ search_images 도구로 "RTX PRO 5000 Blackwell" 이미지를 찾고, 첫 번째
 resolve_media_url 도구로 https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4 의 video URL을 확인해줘.
 ```
 
+`resolve_media_url`은 파일 형식과 직접 URL 후보만 확인합니다. 영상 내용을 실제로 보려면 이어서 `inspect_video`를 호출해야 합니다.
+
 직접 mp4/webm URL이 있을 때:
 
 ```text
@@ -251,6 +253,12 @@ Open WebUI에서는 도구를 켠 뒤 이렇게 물어봅니다.
 
 ```text
 inspect_video 도구로 http://127.0.0.1:9000/me.mp4 영상을 보고 장면을 설명해줘.
+```
+
+모델이 URL 확인만 하고 멈추면 아래처럼 명시합니다.
+
+```text
+resolve_media_url로 확인한 뒤, resolved_url을 inspect_video 도구에 넘겨서 영상 내용을 실제로 분석해줘.
 ```
 
 이 `127.0.0.1`은 사용자의 브라우저 기기가 아니라 Vast 컨테이너 내부에서 tool server와 vLLM이 접근하는 주소입니다. 파일명에 공백이 있으면 URL 인코딩을 쓰거나 파일명을 단순하게 바꾸는 편이 낫습니다.

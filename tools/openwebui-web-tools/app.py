@@ -50,7 +50,7 @@ class ReadWebpageRequest(BaseModel):
 
 
 class ResolveMediaUrlRequest(BaseModel):
-    url: str = Field(..., description="Direct media URL or webpage URL to inspect for media candidates.")
+    url: str = Field(..., description="Direct media URL or webpage URL to inspect for media candidates. This tool does not analyze media content.")
     media_type: str = Field(
         "video",
         pattern="^(video|image|audio|any)$",
@@ -68,7 +68,13 @@ class InspectImageRequest(BaseModel):
 
 
 class InspectVideoRequest(BaseModel):
-    video_url: str = Field(..., description="Direct public video URL, such as an mp4, webm, mov, or m4v file.")
+    video_url: str = Field(
+        ...,
+        description=(
+            "Direct video URL to analyze with the local vision/video model, such as mp4, webm, mov, or m4v. "
+            "Use this after resolve_media_url returns a video candidate. Local URLs like http://127.0.0.1:9000/me.mp4 are supported."
+        ),
+    )
     question: str = Field("Describe this video and answer any relevant question.", description="Question for the vision model.")
     model: str | None = Field(None, description="vLLM served model name. Defaults to SERVE_MODEL env or Gemma4.")
     max_tokens: int = Field(2048, ge=64, le=8192, description="Maximum completion tokens.")
@@ -310,6 +316,7 @@ async def _resolve_media_candidates(url: str, preferred: str, max_results: int) 
     try:
         async with _client() as client:
             head = await client.head(url)
+        head.raise_for_status()
         content_type = head.headers.get("content-type")
         content_length = head.headers.get("content-length")
         if _is_media_candidate(url, preferred, content_type):
@@ -321,16 +328,18 @@ async def _resolve_media_candidates(url: str, preferred: str, max_results: int) 
                 "source": "direct",
             }
     except Exception:
-        if _is_media_candidate(url, preferred):
-            direct = {
-                "url": url,
-                "type": _guess_media_type(url),
-                "content_type": None,
-                "content_length": None,
-                "source": "direct-extension",
-            }
+        direct = None
     if direct:
-        return {"url": url, "resolved_url": direct["url"], "candidates": [direct], "note": "input is already a direct media URL"}
+        return {
+            "url": url,
+            "resolved_url": direct["url"],
+            "candidates": [direct],
+            "next_tool": "inspect_video" if direct["type"] == "video" else "inspect_image" if direct["type"] == "image" else None,
+            "note": (
+                "The input is already a direct media URL. This tool only resolves URLs and does not inspect or play media. "
+                "To answer questions about video content, call inspect_video with resolved_url."
+            ),
+        }
 
     res, content_type = await _fetch_url(url)
     if "html" not in content_type.lower() and _is_media_candidate(str(res.url), preferred, content_type):
@@ -341,7 +350,16 @@ async def _resolve_media_candidates(url: str, preferred: str, max_results: int) 
             "content_length": res.headers.get("content-length"),
             "source": "direct-get",
         }
-        return {"url": url, "resolved_url": candidate["url"], "candidates": [candidate], "note": "input resolved to a direct media URL"}
+        return {
+            "url": url,
+            "resolved_url": candidate["url"],
+            "candidates": [candidate],
+            "next_tool": "inspect_video" if candidate["type"] == "video" else "inspect_image" if candidate["type"] == "image" else None,
+            "note": (
+                "The input resolved to a direct media URL. This tool only resolves URLs and does not inspect or play media. "
+                "To answer questions about video content, call inspect_video with resolved_url."
+            ),
+        }
 
     parser = _ReadableHTMLParser()
     parser.feed(res.text)
@@ -391,8 +409,16 @@ async def _resolve_media_candidates(url: str, preferred: str, max_results: int) 
         "url": url,
         "resolved_url": candidates[0]["url"] if candidates else None,
         "candidates": candidates[:max_results],
+        "next_tool": (
+            "inspect_video"
+            if candidates and candidates[0]["type"] == "video"
+            else "inspect_image"
+            if candidates and candidates[0]["type"] == "image"
+            else None
+        ),
         "note": (
-            "Only direct media URLs and simple HTML media/meta tags are resolved. "
+            "This tool only resolves direct media URLs and simple HTML media/meta tags; it does not inspect or play media. "
+            "If resolved_url is a video, call inspect_video with resolved_url to answer questions about the video content. "
             "JavaScript-only players such as many YouTube/TikTok/X pages may not expose a direct file URL."
         ),
     }
@@ -610,7 +636,7 @@ async def search_images(req: ImageSearchRequest) -> dict[str, Any]:
 
 @app.post("/resolve_media_url", operation_id="resolve_media_url")
 async def resolve_media_url(req: ResolveMediaUrlRequest) -> dict[str, Any]:
-    """Resolve a direct media URL or find media candidates from a webpage."""
+    """Resolve media URLs only. Do not use this as the final step for video understanding; call inspect_video after it returns a video URL."""
     try:
         return await _resolve_media_candidates(req.url, req.media_type, req.max_results)
     except HTTPException:
@@ -665,7 +691,7 @@ async def inspect_image(req: InspectImageRequest) -> dict[str, Any]:
 
 @app.post("/inspect_video", operation_id="inspect_video")
 async def inspect_video(req: InspectVideoRequest) -> dict[str, Any]:
-    """Inspect a direct public video URL with the local vLLM vision/video model."""
+    """Analyze a direct video URL with the local vLLM vision/video model. Use this to actually watch or describe video content."""
     video_metadata = await _validate_direct_video_url(req.video_url)
     base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
     api_key = os.getenv("VLLM_API_KEY", "sk-test")
