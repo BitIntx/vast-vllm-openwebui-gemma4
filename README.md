@@ -10,6 +10,7 @@
 - vLLM 0.23.0
 - Open WebUI
 - Gemma4 NVFP4 계열 모델
+- Qwen3.6 NVFP4 계열 모델도 별도 스크립트로 간단 테스트
 
 ## 1. Clone
 
@@ -85,6 +86,51 @@ Open WebUI의 native tool calling을 쓰려면 이것도 필요합니다.
 --tool-call-parser gemma4
 --enable-auto-tool-choice
 ```
+
+### Qwen3.6 NVFP4 test variant
+
+Gemma4 설정은 그대로 두고 Qwen3.6 계열 모델만 빠르게 테스트하려면:
+
+```bash
+bash scripts/run-vllm-qwen36.sh
+```
+
+기본 모델:
+
+```text
+lyf/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-NVFP4
+```
+
+Gemma4와 다른 핵심 parser 옵션:
+
+```bash
+--reasoning-parser qwen3
+--tool-call-parser qwen3_xml
+--enable-auto-tool-choice
+```
+
+테스트 당시 `tool_choice: "auto"` 요청에서 vLLM 응답이 아래처럼 구조화된 `tool_calls`를 반환했습니다.
+
+```json
+{
+  "message": {
+    "content": null,
+    "tool_calls": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search_web",
+          "arguments": "{\"query\":\"RTX PRO 5000 Blackwell vLLM\"}"
+        }
+      }
+    ],
+    "reasoning": "..."
+  },
+  "finish_reason": "tool_calls"
+}
+```
+
+Open WebUI에서 이 모델로 tool을 자동 선택하게 하려면 모델 설정에서 Function Calling을 `Native`로 두고 도구를 켜야 합니다. 이 레포의 기본 자동 도구 메타 설정은 환경에 따라 특정 모델 ID에만 붙어 있을 수 있습니다.
 
 ## 4. Start Open WebUI
 
