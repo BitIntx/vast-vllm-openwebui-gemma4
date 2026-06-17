@@ -7,6 +7,7 @@ Tools:
 - `search_web`: web search using Brave if `BRAVE_SEARCH_API_KEY` is set, otherwise DuckDuckGo HTML.
 - `search_images`: image search using Brave, Tavily, then DuckDuckGo fallback.
 - `inspect_image`: sends a public image URL to local vLLM vision model.
+- `inspect_video`: sends a direct public mp4/webm/mov/m4v URL to local vLLM video model.
 
 Default local URL:
 
@@ -20,6 +21,15 @@ Open WebUI:
 2. Add OpenAPI server URL: `http://127.0.0.1:17071/openapi.json`.
 3. Enable tools for the model.
 4. For native tool calling with Gemma4, serve vLLM with `--tool-call-parser gemma4`.
+
+Direct video URLs only:
+
+```text
+https://example.com/video.mp4
+https://example.com/video.webm
+```
+
+This does not download YouTube/TikTok/X pages or extract frames from HTML pages.
 
 Optional env:
 

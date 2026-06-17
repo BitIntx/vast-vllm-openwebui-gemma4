@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
-APP_TITLE = "Open WebUI Web + Image Tools"
+APP_TITLE = "Open WebUI Web + Image + Video Tools"
 DEFAULT_MODEL = "AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4"
 
 
@@ -18,7 +18,8 @@ app = FastAPI(
     title=APP_TITLE,
     description=(
         "OpenAPI tool server for Open WebUI. Provides web search, image search, "
-        "and image inspection through the local vLLM OpenAI-compatible endpoint."
+        "image inspection, and direct video URL inspection through the local "
+        "vLLM OpenAI-compatible endpoint."
     ),
     version="0.1.0",
 )
@@ -47,6 +48,15 @@ class InspectImageRequest(BaseModel):
     question: str = Field("Describe this image and answer any relevant question.", description="Question for the vision model.")
     model: str | None = Field(None, description="vLLM served model name. Defaults to SERVE_MODEL env or Gemma4.")
     max_tokens: int = Field(768, ge=64, le=4096, description="Maximum completion tokens.")
+    enable_thinking: bool = Field(True, description="Whether to enable Gemma4 thinking for this image inspection call.")
+
+
+class InspectVideoRequest(BaseModel):
+    video_url: str = Field(..., description="Direct public video URL, such as an mp4, webm, mov, or m4v file.")
+    question: str = Field("Describe this video and answer any relevant question.", description="Question for the vision model.")
+    model: str | None = Field(None, description="vLLM served model name. Defaults to SERVE_MODEL env or Gemma4.")
+    max_tokens: int = Field(2048, ge=64, le=8192, description="Maximum completion tokens.")
+    enable_thinking: bool = Field(False, description="Whether to enable Gemma4 thinking for this video inspection call.")
 
 
 def _client() -> httpx.AsyncClient:
@@ -77,6 +87,48 @@ def _decode_ddg_href(href: str) -> str:
     if "uddg" in qs and qs["uddg"]:
         return qs["uddg"][0]
     return href
+
+
+def _looks_like_direct_video_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.lower()
+    return path.endswith((".mp4", ".webm", ".mov", ".m4v"))
+
+
+async def _validate_direct_video_url(url: str) -> dict[str, Any]:
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="video_url must start with http:// or https://")
+
+    metadata: dict[str, Any] = {"content_type": None, "content_length": None, "validated_by": "extension"}
+    if _looks_like_direct_video_url(url):
+        return metadata
+
+    try:
+        async with _client() as client:
+            res = await client.head(url)
+            metadata["content_type"] = res.headers.get("content-type")
+            metadata["content_length"] = res.headers.get("content-length")
+            metadata["validated_by"] = "head"
+            res.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "video_url does not look like a direct mp4/webm/mov/m4v URL, "
+                f"and HEAD validation failed: {exc}"
+            ),
+        ) from exc
+
+    content_type = (metadata.get("content_type") or "").lower()
+    if not content_type.startswith("video/"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "video_url must be a direct video file URL. "
+                f"Got content-type: {metadata.get('content_type') or 'unknown'}"
+            ),
+        )
+    return metadata
 
 
 async def _brave_web_search(query: str, max_results: int) -> list[dict[str, Any]]:
@@ -241,7 +293,7 @@ async def root() -> dict[str, Any]:
         "name": APP_TITLE,
         "status": "ok",
         "openapi_url": "/openapi.json",
-        "tools": ["search_web", "search_images", "inspect_image"],
+        "tools": ["search_web", "search_images", "inspect_image", "inspect_video"],
     }
 
 
@@ -290,7 +342,7 @@ async def inspect_image(req: InspectImageRequest) -> dict[str, Any]:
         ],
         "max_tokens": req.max_tokens,
         "temperature": 0.2,
-        "chat_template_kwargs": {"enable_thinking": True},
+        "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
     }
     try:
         async with _client() as client:
@@ -307,6 +359,52 @@ async def inspect_image(req: InspectImageRequest) -> dict[str, Any]:
     message = data.get("choices", [{}])[0].get("message", {})
     return {
         "image_url": req.image_url,
+        "question": req.question,
+        "model": model,
+        "reasoning": message.get("reasoning"),
+        "answer": message.get("content"),
+        "raw_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+    }
+
+
+@app.post("/inspect_video", operation_id="inspect_video")
+async def inspect_video(req: InspectVideoRequest) -> dict[str, Any]:
+    """Inspect a direct public video URL with the local vLLM vision/video model."""
+    video_metadata = await _validate_direct_video_url(req.video_url)
+    base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
+    api_key = os.getenv("VLLM_API_KEY", "sk-test")
+    model = req.model or os.getenv("SERVE_MODEL") or DEFAULT_MODEL
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": req.question},
+                    {"type": "video_url", "video_url": {"url": req.video_url}},
+                ],
+            }
+        ],
+        "max_tokens": req.max_tokens,
+        "temperature": 0.2,
+        "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
+    }
+    try:
+        async with _client() as client:
+            res = await client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=httpx.Timeout(300.0, connect=10.0),
+            )
+            res.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"vLLM video inspection failed: {exc}") from exc
+    data = res.json()
+    message = data.get("choices", [{}])[0].get("message", {})
+    return {
+        "video_url": req.video_url,
+        "video_metadata": video_metadata,
         "question": req.question,
         "model": model,
         "reasoning": message.get("reasoning"),
