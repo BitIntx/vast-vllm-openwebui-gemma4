@@ -132,6 +132,13 @@ Gemma4와 다른 핵심 parser 옵션:
 
 Open WebUI에서 이 모델로 tool을 자동 선택하게 하려면 모델 설정에서 Function Calling을 `Native`로 두고 도구를 켜야 합니다. 이 레포의 기본 자동 도구 메타 설정은 환경에 따라 특정 모델 ID에만 붙어 있을 수 있습니다.
 
+Gemma4와 Qwen3.6 모델에 `Web + Image + Video Tools`를 기본 활성화하려면 Open WebUI DB에 model metadata를 넣습니다.
+
+```bash
+python3 scripts/enable-openwebui-model-tools.py
+supervisorctl restart open-webui-vllm
+```
+
 ## 4. Start Open WebUI
 
 새 터미널에서:
