@@ -12,6 +12,7 @@ python3 -m venv "${WORKSPACE_DIR}/venvs/vllm"
 python3 -m venv "${WORKSPACE_DIR}/venvs/webui"
 "${WORKSPACE_DIR}/venvs/webui/bin/python" -m pip install -U pip setuptools wheel
 "${WORKSPACE_DIR}/venvs/webui/bin/pip" install open-webui --no-cache-dir
+"${WORKSPACE_DIR}/venvs/webui/bin/pip" install fastapi "uvicorn[standard]" httpx pydantic pillow imageio-ffmpeg --no-cache-dir
 
 "${WORKSPACE_DIR}/venvs/webui/bin/python" "${SCRIPT_DIR}/patch-openwebui-default-model-tools.py"
 

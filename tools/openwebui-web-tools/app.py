@@ -1,26 +1,45 @@
 import os
 import re
+import base64
+import io
+import subprocess
+import tempfile
 import urllib.parse
 from html.parser import HTMLParser
 from html import unescape
+from pathlib import Path
 from typing import Any
 
+import imageio_ffmpeg
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+from PIL import Image
 from pydantic import BaseModel, Field
 
 
 APP_TITLE = "Open WebUI Web + Image + Video Tools"
 DEFAULT_MODEL = "AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4"
+DEFAULT_OLLAMA_INSPECT_MODEL = "tinyrick/Qwen3.6-35B-A3B-uncensored-heretic-vision-llmfan46:Q4_K_M-cpu4"
+WEB_ONLY_TOOL_PATHS = {
+    "/search_web",
+    "/read_webpage",
+    "/search_images",
+    "/resolve_media_url",
+}
+INSPECT_TOOL_PATHS = {
+    "/inspect_image",
+    "/inspect_video",
+}
 
 
 app = FastAPI(
     title=APP_TITLE,
     description=(
         "OpenAPI tool server for Open WebUI. Provides web search, webpage reading, "
-        "image search, media URL resolution, image inspection, and direct video URL "
-        "inspection through the local vLLM OpenAI-compatible endpoint."
+        "image search, media URL resolution, image inspection, and video inspection "
+        "through a local Ollama or vLLM backend."
     ),
     version="0.2.0",
 )
@@ -32,6 +51,46 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _inspect_tools_enabled() -> bool:
+    value = os.getenv("ENABLE_INSPECT_TOOLS", os.getenv("ENABLE_OLLAMA_INSPECT_TOOLS", "true"))
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _tool_backend() -> str:
+    backend = os.getenv("TOOL_BACKEND", "ollama").strip().lower()
+    if backend not in {"ollama", "vllm"}:
+        return "ollama"
+    return backend
+
+
+def custom_openapi() -> dict[str, Any]:
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+
+    allowed_tool_paths = WEB_ONLY_TOOL_PATHS | (INSPECT_TOOL_PATHS if _inspect_tools_enabled() else set())
+    schema["paths"] = {
+        path: methods
+        for path, methods in schema.get("paths", {}).items()
+        if path in allowed_tool_paths
+    }
+    if not _inspect_tools_enabled():
+        for schema_name in ("InspectImageRequest", "InspectVideoRequest"):
+            schema.get("components", {}).get("schemas", {}).pop(schema_name, None)
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 
 class WebSearchRequest(BaseModel):
@@ -62,23 +121,24 @@ class ResolveMediaUrlRequest(BaseModel):
 class InspectImageRequest(BaseModel):
     image_url: str = Field(..., description="Public image URL to inspect.")
     question: str = Field("Describe this image and answer any relevant question.", description="Question for the vision model.")
-    model: str | None = Field(None, description="vLLM served model name. Defaults to the currently served model from /v1/models.")
+    model: str | None = Field(None, description="Vision model name. With Ollama, defaults to OLLAMA_INSPECT_MODEL or the first installed vision-capable model. With vLLM, defaults to the served model.")
     max_tokens: int = Field(768, ge=64, le=4096, description="Maximum completion tokens.")
-    enable_thinking: bool = Field(True, description="Whether to enable Gemma4 thinking for this image inspection call.")
+    enable_thinking: bool = Field(False, description="Used by vLLM Gemma-style models. Ollama image inspection ignores this flag.")
 
 
 class InspectVideoRequest(BaseModel):
     video_url: str = Field(
         ...,
         description=(
-            "Direct video URL to analyze with the local vision/video model, such as mp4, webm, mov, or m4v. "
+            "Direct video URL to analyze by sampling frames and sending them to the local Ollama vision model, such as mp4, webm, mov, or m4v. "
             "Use this after resolve_media_url returns a video candidate. Local URLs like http://127.0.0.1:9000/me.mp4 are supported."
         ),
     )
     question: str = Field("Describe this video and answer any relevant question.", description="Question for the vision model.")
-    model: str | None = Field(None, description="vLLM served model name. Defaults to the currently served model from /v1/models.")
+    model: str | None = Field(None, description="Vision model name. With Ollama, defaults to OLLAMA_INSPECT_MODEL or the first installed vision-capable model. With vLLM, defaults to the served model.")
     max_tokens: int = Field(2048, ge=64, le=8192, description="Maximum completion tokens.")
-    enable_thinking: bool = Field(False, description="Whether to enable Gemma4 thinking for this video inspection call.")
+    max_frames: int = Field(4, ge=1, le=12, description="Maximum video frames to sample and send to the vision model.")
+    enable_thinking: bool = Field(False, description="Used by vLLM Gemma-style models. Ollama video inspection ignores this flag.")
 
 
 def _client() -> httpx.AsyncClient:
@@ -124,6 +184,265 @@ def _vllm_error_detail(prefix: str, exc: Exception) -> str:
             body = body[:800] + "...[truncated]"
         return f"{prefix}: HTTP {exc.response.status_code}: {body}"
     return f"{prefix}: {exc}"
+
+
+def _ollama_base_url() -> str:
+    return os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+
+
+def _max_image_side() -> int:
+    return int(os.getenv("OLLAMA_INSPECT_MAX_IMAGE_SIDE", "1024"))
+
+
+def _max_image_bytes() -> int:
+    return int(os.getenv("OLLAMA_INSPECT_MAX_IMAGE_MB", "20")) * 1024 * 1024
+
+
+def _max_video_bytes() -> int:
+    return int(os.getenv("OLLAMA_INSPECT_MAX_VIDEO_MB", "200")) * 1024 * 1024
+
+
+async def _resolve_ollama_model(requested_model: str | None) -> str:
+    if requested_model:
+        return requested_model
+
+    configured_model = os.getenv("OLLAMA_INSPECT_MODEL")
+    if configured_model:
+        return configured_model
+
+    try:
+        async with _client() as client:
+            res = await client.get(f"{_ollama_base_url()}/api/tags")
+            res.raise_for_status()
+        for item in res.json().get("models", []):
+            if "vision" in item.get("capabilities", []):
+                return item.get("model") or item.get("name") or DEFAULT_OLLAMA_INSPECT_MODEL
+    except Exception:
+        pass
+
+    return DEFAULT_OLLAMA_INSPECT_MODEL
+
+
+def _encode_image_bytes_for_ollama(content: bytes) -> str:
+    try:
+        image = Image.open(io.BytesIO(content))
+        image.thumbnail((_max_image_side(), _max_image_side()))
+        if image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=85, optimize=True)
+        content = out.getvalue()
+    except Exception:
+        # Ollama accepts raw base64 image bytes too; keep the original when
+        # Pillow cannot decode but the upstream URL still returned image data.
+        pass
+
+    return base64.b64encode(content).decode("ascii")
+
+
+async def _fetch_image_for_ollama(image_url: str) -> str:
+    _require_http_url(image_url, "image_url")
+    try:
+        async with _client() as client:
+            res = await client.get(image_url, timeout=httpx.Timeout(60.0, connect=10.0))
+            res.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"image_url fetch failed: HTTP {exc.response.status_code}: {exc.response.text[:300]}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"image_url fetch failed: {exc}") from exc
+    content_type = res.headers.get("content-type", "").split(";", 1)[0].lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"image_url must return image content. Got {content_type}")
+    if len(res.content) > _max_image_bytes():
+        raise HTTPException(status_code=413, detail=f"image is larger than {_max_image_bytes() // 1024 // 1024} MB")
+    return _encode_image_bytes_for_ollama(res.content)
+
+
+async def _call_ollama_vision(
+    *,
+    model: str,
+    prompt: str,
+    images: list[str],
+    max_tokens: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": images,
+            }
+        ],
+        "stream": False,
+        "think": False,
+        "options": {
+            "num_predict": max_tokens,
+            "temperature": 0.2,
+        },
+        "keep_alive": os.getenv("OLLAMA_INSPECT_KEEP_ALIVE", "5m"),
+    }
+    try:
+        async with _client() as client:
+            res = await client.post(
+                f"{_ollama_base_url()}/api/chat",
+                json=payload,
+                timeout=httpx.Timeout(timeout_seconds, connect=10.0),
+            )
+            res.raise_for_status()
+    except Exception as exc:
+        if isinstance(exc, httpx.HTTPStatusError):
+            body = exc.response.text.strip()
+            if len(body) > 800:
+                body = body[:800] + "...[truncated]"
+            raise HTTPException(status_code=502, detail=f"Ollama vision call failed: HTTP {exc.response.status_code}: {body}") from exc
+        raise HTTPException(status_code=502, detail=f"Ollama vision call failed: {exc}") from exc
+    return res.json()
+
+
+async def _call_vllm_image_inspection(req: InspectImageRequest) -> dict[str, Any]:
+    base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
+    api_key = os.getenv("VLLM_API_KEY", "sk-test")
+    model = await _resolve_vllm_model(req.model, base_url, api_key)
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": req.question},
+                    {"type": "image_url", "image_url": {"url": req.image_url}},
+                ],
+            }
+        ],
+        "max_tokens": req.max_tokens,
+        "temperature": 0.2,
+        "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
+    }
+    try:
+        async with _client() as client:
+            res = await client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=httpx.Timeout(180.0, connect=10.0),
+            )
+            res.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=_vllm_error_detail("vLLM image inspection failed", exc)) from exc
+
+    data = res.json()
+    message = data.get("choices", [{}])[0].get("message", {})
+    return {
+        "backend": "vllm",
+        "image_url": req.image_url,
+        "question": req.question,
+        "model": model,
+        "reasoning": message.get("reasoning"),
+        "answer": message.get("content"),
+        "raw_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+    }
+
+
+async def _call_vllm_video_inspection(req: InspectVideoRequest, video_metadata: dict[str, Any]) -> dict[str, Any]:
+    base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
+    api_key = os.getenv("VLLM_API_KEY", "sk-test")
+    model = await _resolve_vllm_model(req.model, base_url, api_key)
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": req.question},
+                    {"type": "video_url", "video_url": {"url": req.video_url}},
+                ],
+            }
+        ],
+        "max_tokens": req.max_tokens,
+        "temperature": 0.2,
+        "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
+    }
+    try:
+        async with _client() as client:
+            res = await client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=httpx.Timeout(300.0, connect=10.0),
+            )
+            res.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=_vllm_error_detail("vLLM video inspection failed", exc)) from exc
+
+    data = res.json()
+    message = data.get("choices", [{}])[0].get("message", {})
+    return {
+        "backend": "vllm",
+        "video_url": req.video_url,
+        "video_metadata": video_metadata,
+        "question": req.question,
+        "model": model,
+        "reasoning": message.get("reasoning"),
+        "answer": message.get("content"),
+        "raw_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+    }
+
+
+async def _download_media_to_temp(url: str, suffix: str, max_bytes: int) -> Path:
+    _require_http_url(url)
+    fd, path = tempfile.mkstemp(prefix="owui-media-", suffix=suffix)
+    os.close(fd)
+    target = Path(path)
+    size = 0
+    try:
+        async with _client() as client:
+            async with client.stream("GET", url, timeout=httpx.Timeout(120.0, connect=10.0)) as res:
+                res.raise_for_status()
+                with target.open("wb") as f:
+                    async for chunk in res.aiter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise HTTPException(status_code=413, detail=f"media is larger than {max_bytes // 1024 // 1024} MB")
+                        f.write(chunk)
+        return target
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+
+
+def _extract_frames_with_ffmpeg(video_path: Path, max_frames: int) -> list[str]:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.TemporaryDirectory(prefix="owui-frames-") as frame_dir:
+        output_pattern = str(Path(frame_dir) / "frame_%03d.jpg")
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"fps=1/5,scale='min({_max_image_side()},iw)':-2",
+            "-frames:v",
+            str(max_frames),
+            output_pattern,
+        ]
+        result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        if result.returncode != 0:
+            raise HTTPException(status_code=502, detail=f"ffmpeg frame extraction failed: {result.stderr.strip()}")
+
+        frames = sorted(Path(frame_dir).glob("frame_*.jpg"))
+        if not frames:
+            raise HTTPException(status_code=502, detail="ffmpeg did not extract any video frames")
+
+        return [_encode_image_bytes_for_ollama(frame.read_bytes()) for frame in frames]
 
 
 class _ReadableHTMLParser(HTMLParser):
@@ -623,9 +942,8 @@ async def root() -> dict[str, Any]:
             "read_webpage",
             "search_images",
             "resolve_media_url",
-            "inspect_image",
-            "inspect_video",
-        ],
+        ]
+        + (["inspect_image", "inspect_video"] if _inspect_tools_enabled() else []),
     }
 
 
@@ -679,89 +997,74 @@ async def resolve_media_url(req: ResolveMediaUrlRequest) -> dict[str, Any]:
 
 @app.post("/inspect_image", operation_id="inspect_image")
 async def inspect_image(req: InspectImageRequest) -> dict[str, Any]:
-    """Inspect a public image URL with the local vLLM vision model."""
-    base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
-    api_key = os.getenv("VLLM_API_KEY", "sk-test")
-    model = await _resolve_vllm_model(req.model, base_url, api_key)
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": req.question},
-                    {"type": "image_url", "image_url": {"url": req.image_url}},
-                ],
-            }
-        ],
-        "max_tokens": req.max_tokens,
-        "temperature": 0.2,
-        "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
-    }
-    try:
-        async with _client() as client:
-            res = await client.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=httpx.Timeout(180.0, connect=10.0),
-            )
-            res.raise_for_status()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=_vllm_error_detail("vLLM image inspection failed", exc)) from exc
-    data = res.json()
-    message = data.get("choices", [{}])[0].get("message", {})
+    """Inspect a public image URL with the configured local vision backend."""
+    if _tool_backend() == "vllm":
+        return await _call_vllm_image_inspection(req)
+
+    model = await _resolve_ollama_model(req.model)
+    image = await _fetch_image_for_ollama(req.image_url)
+    data = await _call_ollama_vision(
+        model=model,
+        prompt=req.question,
+        images=[image],
+        max_tokens=req.max_tokens,
+        timeout_seconds=float(os.getenv("OLLAMA_IMAGE_TIMEOUT_SECONDS", "300")),
+    )
+    message = data.get("message", {})
     return {
+        "backend": "ollama",
         "image_url": req.image_url,
         "question": req.question,
         "model": model,
-        "reasoning": message.get("reasoning"),
         "answer": message.get("content"),
-        "raw_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+        "thinking": message.get("thinking"),
+        "done_reason": data.get("done_reason"),
+        "eval_count": data.get("eval_count"),
+        "eval_duration": data.get("eval_duration"),
     }
 
 
 @app.post("/inspect_video", operation_id="inspect_video")
 async def inspect_video(req: InspectVideoRequest) -> dict[str, Any]:
-    """Analyze a direct video URL with the local vLLM vision/video model. Use this to actually watch or describe video content."""
+    """Analyze a direct video URL with vLLM video input or Ollama frame sampling."""
     video_metadata = await _validate_direct_video_url(req.video_url)
-    base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
-    api_key = os.getenv("VLLM_API_KEY", "sk-test")
-    model = await _resolve_vllm_model(req.model, base_url, api_key)
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": req.question},
-                    {"type": "video_url", "video_url": {"url": req.video_url}},
-                ],
-            }
-        ],
-        "max_tokens": req.max_tokens,
-        "temperature": 0.2,
-        "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
-    }
+    if _tool_backend() == "vllm":
+        return await _call_vllm_video_inspection(req, video_metadata)
+
+    model = await _resolve_ollama_model(req.model)
+    video_path: Path | None = None
     try:
-        async with _client() as client:
-            res = await client.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=httpx.Timeout(300.0, connect=10.0),
-            )
-            res.raise_for_status()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=_vllm_error_detail("vLLM video inspection failed", exc)) from exc
-    data = res.json()
-    message = data.get("choices", [{}])[0].get("message", {})
+        suffix = Path(urllib.parse.urlparse(req.video_url).path).suffix or ".mp4"
+        video_path = await _download_media_to_temp(req.video_url, suffix, _max_video_bytes())
+        frames = _extract_frames_with_ffmpeg(video_path, req.max_frames)
+    finally:
+        if video_path:
+            video_path.unlink(missing_ok=True)
+
+    prompt = (
+        f"{req.question}\n\n"
+        f"The input video was sampled into {len(frames)} chronological frames. "
+        "Base your answer only on what can be inferred from these sampled frames, "
+        "and mention uncertainty when motion or audio would be required."
+    )
+    data = await _call_ollama_vision(
+        model=model,
+        prompt=prompt,
+        images=frames,
+        max_tokens=req.max_tokens,
+        timeout_seconds=float(os.getenv("OLLAMA_VIDEO_TIMEOUT_SECONDS", "600")),
+    )
+    message = data.get("message", {})
     return {
+        "backend": "ollama",
         "video_url": req.video_url,
         "video_metadata": video_metadata,
         "question": req.question,
         "model": model,
-        "reasoning": message.get("reasoning"),
+        "sampled_frames": len(frames),
         "answer": message.get("content"),
-        "raw_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+        "thinking": message.get("thinking"),
+        "done_reason": data.get("done_reason"),
+        "eval_count": data.get("eval_count"),
+        "eval_duration": data.get("eval_duration"),
     }
