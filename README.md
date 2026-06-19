@@ -21,10 +21,12 @@ read_webpage
 search_images
 resolve_media_url
 inspect_image
+inspect_image_deep
+ocr_image
 inspect_video
 ```
 
-`search_web`, `read_webpage`, `search_images`, and `resolve_media_url` do not require vLLM or Ollama. `inspect_image` and `inspect_video` use the configured backend.
+`search_web`, `read_webpage`, `search_images`, and `resolve_media_url` do not require vLLM or Ollama. `inspect_image`, `inspect_image_deep`, and `inspect_video` use the configured model backend. `ocr_image` uses EasyOCR locally.
 
 ## Clone
 
@@ -116,7 +118,10 @@ If `OLLAMA_INSPECT_MODEL` is empty, the tool server tries to pick the first inst
 In Ollama mode:
 
 - `inspect_image` downloads the image URL, resizes it, converts it to JPEG/base64, and calls Ollama `/api/chat`.
+- `inspect_image_deep` sends one overview image plus zoomed crop tiles to Ollama vision for small text, UI, and object details.
+- `ocr_image` extracts text, bounding boxes, and confidence scores with EasyOCR. The default languages are Korean and English.
 - `inspect_video` downloads a direct video file, samples frames with ffmpeg, and sends those frames to Ollama vision.
+- Thinking is enabled by default for inspection. If a model spends the whole token budget thinking and returns an empty final answer, the tool retries once without thinking by default.
 
 Ollama video inspection is frame-sampling based, not native video understanding. Audio, fast motion, and events between sampled frames can be missed.
 
@@ -167,6 +172,14 @@ Use read_webpage to read https://github.com/open-webui/openapi-servers and summa
 
 ```text
 Use search_images to find "RTX PRO 5000 Blackwell", then inspect the first image URL with inspect_image.
+```
+
+```text
+Use inspect_image_deep on an image URL and read small labels, logos, and visible text carefully.
+```
+
+```text
+Use ocr_image on a screenshot URL and return the extracted text with confidence.
 ```
 
 ```text

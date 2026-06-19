@@ -15,7 +15,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
 
@@ -30,6 +30,8 @@ WEB_ONLY_TOOL_PATHS = {
 }
 INSPECT_TOOL_PATHS = {
     "/inspect_image",
+    "/inspect_image_deep",
+    "/ocr_image",
     "/inspect_video",
 }
 
@@ -63,6 +65,10 @@ def _tool_backend() -> str:
     if backend not in {"ollama", "vllm"}:
         return "ollama"
     return backend
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def custom_openapi() -> dict[str, Any]:
@@ -122,8 +128,34 @@ class InspectImageRequest(BaseModel):
     image_url: str = Field(..., description="Public image URL to inspect.")
     question: str = Field("Describe this image and answer any relevant question.", description="Question for the vision model.")
     model: str | None = Field(None, description="Vision model name. With Ollama, defaults to OLLAMA_INSPECT_MODEL or the first installed vision-capable model. With vLLM, defaults to the served model.")
-    max_tokens: int = Field(768, ge=64, le=4096, description="Maximum completion tokens.")
-    enable_thinking: bool = Field(False, description="Used by vLLM Gemma-style models. Ollama image inspection ignores this flag.")
+    max_tokens: int = Field(4096, ge=64, le=8192, description="Maximum completion tokens.")
+    enable_thinking: bool = Field(True, description="Enable deeper reasoning for image inspection when the backend supports it.")
+
+
+class InspectImageDeepRequest(BaseModel):
+    image_url: str = Field(..., description="Public image URL to inspect with overview plus zoomed crop tiles.")
+    question: str = Field(
+        "Analyze this image in detail. Include visible text, small objects, relationships, and uncertainty.",
+        description="Question for the vision model.",
+    )
+    model: str | None = Field(None, description="Vision model name. With Ollama, defaults to OLLAMA_INSPECT_MODEL or the first installed vision-capable model.")
+    max_tokens: int = Field(8192, ge=512, le=16384, description="Maximum completion tokens.")
+    max_tiles: int = Field(8, ge=1, le=20, description="Maximum number of zoomed crop tiles to send after the overview image.")
+    tile_max_side: int = Field(1536, ge=512, le=2048, description="Maximum long side in pixels for each zoomed crop tile.")
+    overview_max_side: int = Field(2048, ge=512, le=3072, description="Maximum long side in pixels for the overview image.")
+    enable_thinking: bool = Field(True, description="Enable deeper reasoning for image inspection when the backend supports it.")
+
+
+class OcrImageRequest(BaseModel):
+    image_url: str = Field(..., description="Public image URL to OCR.")
+    languages: list[str] = Field(
+        default_factory=lambda: ["ko", "en"],
+        description="EasyOCR language codes, such as ['ko', 'en'] or ['en'].",
+    )
+    max_image_side: int = Field(3072, ge=512, le=4096, description="Maximum long side in pixels before OCR.")
+    min_confidence: float = Field(0.2, ge=0.0, le=1.0, description="Minimum confidence for returned OCR lines.")
+    paragraph: bool = Field(False, description="Group text into paragraphs instead of individual text boxes.")
+    max_results: int = Field(120, ge=1, le=300, description="Maximum OCR boxes or paragraphs to return.")
 
 
 class InspectVideoRequest(BaseModel):
@@ -136,9 +168,9 @@ class InspectVideoRequest(BaseModel):
     )
     question: str = Field("Describe this video and answer any relevant question.", description="Question for the vision model.")
     model: str | None = Field(None, description="Vision model name. With Ollama, defaults to OLLAMA_INSPECT_MODEL or the first installed vision-capable model. With vLLM, defaults to the served model.")
-    max_tokens: int = Field(2048, ge=64, le=8192, description="Maximum completion tokens.")
-    max_frames: int = Field(4, ge=1, le=12, description="Maximum video frames to sample and send to the vision model.")
-    enable_thinking: bool = Field(False, description="Used by vLLM Gemma-style models. Ollama video inspection ignores this flag.")
+    max_tokens: int = Field(8192, ge=64, le=16384, description="Maximum completion tokens.")
+    max_frames: int = Field(8, ge=1, le=16, description="Maximum video frames to sample and send to the vision model.")
+    enable_thinking: bool = Field(True, description="Enable deeper reasoning for video inspection when the backend supports it.")
 
 
 def _client() -> httpx.AsyncClient:
@@ -191,15 +223,100 @@ def _ollama_base_url() -> str:
 
 
 def _max_image_side() -> int:
-    return int(os.getenv("OLLAMA_INSPECT_MAX_IMAGE_SIDE", "1024"))
+    return int(os.getenv("OLLAMA_INSPECT_MAX_IMAGE_SIDE", "2048"))
 
 
 def _max_image_bytes() -> int:
-    return int(os.getenv("OLLAMA_INSPECT_MAX_IMAGE_MB", "20")) * 1024 * 1024
+    return int(os.getenv("OLLAMA_INSPECT_MAX_IMAGE_MB", "50")) * 1024 * 1024
 
 
 def _max_video_bytes() -> int:
     return int(os.getenv("OLLAMA_INSPECT_MAX_VIDEO_MB", "200")) * 1024 * 1024
+
+
+def _return_inspect_thinking() -> bool:
+    return _env_bool("OLLAMA_INSPECT_RETURN_THINKING", "false")
+
+
+_EASYOCR_READERS: dict[tuple[str, ...], Any] = {}
+
+
+def _get_easyocr_reader(languages: list[str]) -> Any:
+    normalized = tuple(dict.fromkeys(lang.strip().lower() for lang in languages if lang.strip()))
+    if not normalized:
+        normalized = ("en",)
+    if normalized not in _EASYOCR_READERS:
+        try:
+            import easyocr
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"EasyOCR is not installed or failed to import: {exc}") from exc
+        _EASYOCR_READERS[normalized] = easyocr.Reader(list(normalized), gpu=False, verbose=False)
+    return _EASYOCR_READERS[normalized]
+
+
+def _ocr_image_with_easyocr(req: OcrImageRequest, image: Image.Image) -> dict[str, Any]:
+    try:
+        import numpy as np
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"NumPy is required for OCR: {exc}") from exc
+
+    work = image.copy()
+    work.thumbnail((req.max_image_side, req.max_image_side))
+    if work.mode != "RGB":
+        work = work.convert("RGB")
+
+    scale_x = image.width / work.width if work.width else 1.0
+    scale_y = image.height / work.height if work.height else 1.0
+    reader = _get_easyocr_reader(req.languages)
+    try:
+        raw_results = reader.readtext(np.array(work), paragraph=req.paragraph)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"EasyOCR failed: {exc}") from exc
+
+    lines: list[dict[str, Any]] = []
+    for raw in raw_results:
+        if len(raw) == 3:
+            bbox, text, confidence = raw
+        elif len(raw) == 2:
+            bbox, text = raw
+            confidence = None
+        else:
+            continue
+        if confidence is not None and float(confidence) < req.min_confidence:
+            continue
+        points = [
+            {"x": round(float(x) * scale_x), "y": round(float(y) * scale_y)}
+            for x, y in bbox
+        ]
+        xs = [point["x"] for point in points]
+        ys = [point["y"] for point in points]
+        lines.append(
+            {
+                "text": str(text).strip(),
+                "confidence": round(float(confidence), 4) if confidence is not None else None,
+                "bbox": {
+                    "left": min(xs),
+                    "top": min(ys),
+                    "right": max(xs),
+                    "bottom": max(ys),
+                },
+                "points": points,
+            }
+        )
+
+    lines = [line for line in lines if line["text"]]
+    lines.sort(key=lambda item: (item["bbox"]["top"], item["bbox"]["left"]))
+    lines = lines[: req.max_results]
+    text = "\n".join(line["text"] for line in lines)
+    return {
+        "engine": "easyocr",
+        "languages": list(dict.fromkeys(req.languages)),
+        "image_size": {"width": image.width, "height": image.height},
+        "ocr_size": {"width": work.width, "height": work.height},
+        "line_count": len(lines),
+        "text": text,
+        "lines": lines,
+    }
 
 
 async def _resolve_ollama_model(requested_model: str | None) -> str:
@@ -226,13 +343,7 @@ async def _resolve_ollama_model(requested_model: str | None) -> str:
 def _encode_image_bytes_for_ollama(content: bytes) -> str:
     try:
         image = Image.open(io.BytesIO(content))
-        image.thumbnail((_max_image_side(), _max_image_side()))
-        if image.mode not in {"RGB", "L"}:
-            image = image.convert("RGB")
-
-        out = io.BytesIO()
-        image.save(out, format="JPEG", quality=85, optimize=True)
-        content = out.getvalue()
+        return _encode_pil_image_for_ollama(image, _max_image_side())
     except Exception:
         # Ollama accepts raw base64 image bytes too; keep the original when
         # Pillow cannot decode but the upstream URL still returned image data.
@@ -241,7 +352,30 @@ def _encode_image_bytes_for_ollama(content: bytes) -> str:
     return base64.b64encode(content).decode("ascii")
 
 
-async def _fetch_image_for_ollama(image_url: str) -> str:
+def _encode_pil_image_for_ollama(image: Image.Image, max_side: int, label: str | None = None) -> str:
+    image = image.copy()
+    image.thumbnail((max_side, max_side))
+    if image.mode not in {"RGB", "L"}:
+        image = image.convert("RGB")
+    if image.mode == "L":
+        image = image.convert("RGB")
+
+    if label:
+        draw = ImageDraw.Draw(image)
+        pad = max(6, image.width // 160)
+        text_bbox = draw.textbbox((0, 0), label)
+        box_w = text_bbox[2] - text_bbox[0] + pad * 2
+        box_h = text_bbox[3] - text_bbox[1] + pad * 2
+        draw.rectangle((0, 0, min(image.width, box_w), min(image.height, box_h)), fill=(255, 255, 255))
+        draw.rectangle((0, 0, image.width - 1, image.height - 1), outline=(255, 0, 0), width=max(2, image.width // 300))
+        draw.text((pad, pad), label, fill=(0, 0, 0))
+
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=88, optimize=True)
+    return base64.b64encode(out.getvalue()).decode("ascii")
+
+
+async def _fetch_image_content(image_url: str) -> bytes:
     _require_http_url(image_url, "image_url")
     try:
         async with _client() as client:
@@ -259,7 +393,74 @@ async def _fetch_image_for_ollama(image_url: str) -> str:
         raise HTTPException(status_code=400, detail=f"image_url must return image content. Got {content_type}")
     if len(res.content) > _max_image_bytes():
         raise HTTPException(status_code=413, detail=f"image is larger than {_max_image_bytes() // 1024 // 1024} MB")
-    return _encode_image_bytes_for_ollama(res.content)
+    return res.content
+
+
+async def _fetch_image_for_ollama(image_url: str) -> str:
+    return _encode_image_bytes_for_ollama(await _fetch_image_content(image_url))
+
+
+async def _fetch_pil_image(image_url: str) -> Image.Image:
+    content = await _fetch_image_content(image_url)
+    try:
+        image = Image.open(io.BytesIO(content))
+        image.load()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"image_url could not be decoded as an image: {exc}") from exc
+    if image.mode not in {"RGB", "L"}:
+        image = image.convert("RGB")
+    if image.mode == "L":
+        image = image.convert("RGB")
+    return image
+
+
+def _choose_tile_grid(width: int, height: int, max_tiles: int) -> tuple[int, int]:
+    if width <= 0 or height <= 0:
+        return 1, 1
+    aspect = width / height
+    best_cols, best_rows, best_score = 1, 1, float("-inf")
+    for rows in range(1, max_tiles + 1):
+        for cols in range(1, max_tiles + 1):
+            tile_count = rows * cols
+            if tile_count > max_tiles:
+                continue
+            grid_aspect = cols / rows
+            score = tile_count * 100 - abs(grid_aspect - aspect)
+            if score > best_score:
+                best_cols, best_rows, best_score = cols, rows, score
+    return best_cols, best_rows
+
+
+def _build_image_tiles(
+    image: Image.Image, max_tiles: int, tile_max_side: int
+) -> tuple[list[str], list[dict[str, int]]]:
+    width, height = image.size
+    cols, rows = _choose_tile_grid(width, height, max_tiles)
+    tiles: list[str] = []
+    metadata: list[dict[str, int]] = []
+    index = 1
+    for row in range(rows):
+        for col in range(cols):
+            left = round(col * width / cols)
+            upper = round(row * height / rows)
+            right = round((col + 1) * width / cols)
+            lower = round((row + 1) * height / rows)
+            crop = image.crop((left, upper, right, lower))
+            label = f"Tile {index} ({left},{upper})-({right},{lower})"
+            tiles.append(_encode_pil_image_for_ollama(crop, tile_max_side, label=label))
+            metadata.append(
+                {
+                    "tile": index,
+                    "left": left,
+                    "top": upper,
+                    "right": right,
+                    "bottom": lower,
+                    "width": right - left,
+                    "height": lower - upper,
+                }
+            )
+            index += 1
+    return tiles, metadata
 
 
 async def _call_ollama_vision(
@@ -269,6 +470,7 @@ async def _call_ollama_vision(
     images: list[str],
     max_tokens: int,
     timeout_seconds: float,
+    enable_thinking: bool = True,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -280,29 +482,54 @@ async def _call_ollama_vision(
             }
         ],
         "stream": False,
-        "think": False,
+        "think": enable_thinking and _env_bool("OLLAMA_INSPECT_ENABLE_THINKING", "true"),
         "options": {
             "num_predict": max_tokens,
             "temperature": 0.2,
         },
-        "keep_alive": os.getenv("OLLAMA_INSPECT_KEEP_ALIVE", "5m"),
+        "keep_alive": os.getenv("OLLAMA_INSPECT_KEEP_ALIVE", "1h"),
     }
-    try:
-        async with _client() as client:
-            res = await client.post(
-                f"{_ollama_base_url()}/api/chat",
-                json=payload,
-                timeout=httpx.Timeout(timeout_seconds, connect=10.0),
-            )
-            res.raise_for_status()
-    except Exception as exc:
-        if isinstance(exc, httpx.HTTPStatusError):
-            body = exc.response.text.strip()
-            if len(body) > 800:
-                body = body[:800] + "...[truncated]"
-            raise HTTPException(status_code=502, detail=f"Ollama vision call failed: HTTP {exc.response.status_code}: {body}") from exc
-        raise HTTPException(status_code=502, detail=f"Ollama vision call failed: {exc}") from exc
-    return res.json()
+
+    async def post_chat(chat_payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            async with _client() as client:
+                res = await client.post(
+                    f"{_ollama_base_url()}/api/chat",
+                    json=chat_payload,
+                    timeout=httpx.Timeout(timeout_seconds, connect=10.0),
+                )
+                res.raise_for_status()
+        except Exception as exc:
+            if isinstance(exc, httpx.HTTPStatusError):
+                body = exc.response.text.strip()
+                if len(body) > 800:
+                    body = body[:800] + "...[truncated]"
+                raise HTTPException(status_code=502, detail=f"Ollama vision call failed: HTTP {exc.response.status_code}: {body}") from exc
+            raise HTTPException(status_code=502, detail=f"Ollama vision call failed: {exc}") from exc
+        return res.json()
+
+    data = await post_chat(payload)
+    message = data.get("message", {})
+    content = str(message.get("content") or "").strip()
+    should_retry_without_thinking = (
+        bool(payload["think"])
+        and _env_bool("OLLAMA_INSPECT_RETRY_WITHOUT_THINKING", "true")
+        and not content
+        and data.get("done_reason") == "length"
+    )
+    if should_retry_without_thinking:
+        retry_payload = dict(payload)
+        retry_payload["think"] = False
+        retry_data = await post_chat(retry_payload)
+        retry_data["_thinking_retry"] = {
+            "triggered": True,
+            "reason": "empty_answer_after_thinking_length_limit",
+            "first_done_reason": data.get("done_reason"),
+            "first_eval_count": data.get("eval_count"),
+            "first_eval_duration": data.get("eval_duration"),
+        }
+        return retry_data
+    return data
 
 
 async def _call_vllm_image_inspection(req: InspectImageRequest) -> dict[str, Any]:
@@ -943,7 +1170,7 @@ async def root() -> dict[str, Any]:
             "search_images",
             "resolve_media_url",
         ]
-        + (["inspect_image", "inspect_video"] if _inspect_tools_enabled() else []),
+        + (["inspect_image", "inspect_image_deep", "ocr_image", "inspect_video"] if _inspect_tools_enabled() else []),
     }
 
 
@@ -1009,19 +1236,99 @@ async def inspect_image(req: InspectImageRequest) -> dict[str, Any]:
         images=[image],
         max_tokens=req.max_tokens,
         timeout_seconds=float(os.getenv("OLLAMA_IMAGE_TIMEOUT_SECONDS", "300")),
+        enable_thinking=req.enable_thinking,
     )
     message = data.get("message", {})
-    return {
+    result = {
         "backend": "ollama",
         "image_url": req.image_url,
         "question": req.question,
         "model": model,
         "answer": message.get("content"),
-        "thinking": message.get("thinking"),
         "done_reason": data.get("done_reason"),
         "eval_count": data.get("eval_count"),
         "eval_duration": data.get("eval_duration"),
     }
+    if _return_inspect_thinking():
+        result["thinking"] = message.get("thinking")
+    if data.get("_thinking_retry"):
+        result["thinking_retry"] = data["_thinking_retry"]
+    return result
+
+
+@app.post("/inspect_image_deep", operation_id="inspect_image_deep")
+async def inspect_image_deep(req: InspectImageDeepRequest) -> dict[str, Any]:
+    """Inspect an image with an overview plus zoomed crop tiles for small details and text."""
+    if _tool_backend() == "vllm":
+        fallback = InspectImageRequest(
+            image_url=req.image_url,
+            question=req.question,
+            model=req.model,
+            max_tokens=min(req.max_tokens, 8192),
+            enable_thinking=req.enable_thinking,
+        )
+        data = await _call_vllm_image_inspection(fallback)
+        data["note"] = "vLLM backend currently uses single-image inspection for inspect_image_deep."
+        return data
+
+    model = await _resolve_ollama_model(req.model)
+    image = await _fetch_pil_image(req.image_url)
+    overview = _encode_pil_image_for_ollama(image, req.overview_max_side, label="Overview")
+    tiles, tile_metadata = _build_image_tiles(image, req.max_tiles, req.tile_max_side)
+    tile_lines = [
+        f"- Tile {item['tile']}: crop box left={item['left']}, top={item['top']}, "
+        f"right={item['right']}, bottom={item['bottom']} in original pixel coordinates."
+        for item in tile_metadata
+    ]
+    prompt = (
+        f"{req.question}\n\n"
+        "You will receive one overview image followed by zoomed crop tiles. "
+        "The overview shows the whole image. Each tile is labeled in the image and listed below. "
+        "Use the tiles to inspect small text, small objects, faces, logos, UI details, and spatial relationships. "
+        "If text is visible, transcribe it as accurately as possible and state uncertainty when characters are unclear. "
+        "Avoid inventing details that are not visible.\n\n"
+        f"Original image size: {image.width}x{image.height} pixels.\n"
+        "Tile map:\n"
+        + "\n".join(tile_lines)
+    )
+    data = await _call_ollama_vision(
+        model=model,
+        prompt=prompt,
+        images=[overview, *tiles],
+        max_tokens=req.max_tokens,
+        timeout_seconds=float(os.getenv("OLLAMA_IMAGE_DEEP_TIMEOUT_SECONDS", "900")),
+        enable_thinking=req.enable_thinking,
+    )
+    message = data.get("message", {})
+    result = {
+        "backend": "ollama",
+        "image_url": req.image_url,
+        "question": req.question,
+        "model": model,
+        "image_size": {"width": image.width, "height": image.height},
+        "overview_max_side": req.overview_max_side,
+        "tile_max_side": req.tile_max_side,
+        "tile_count": len(tiles),
+        "tiles": tile_metadata,
+        "answer": message.get("content"),
+        "done_reason": data.get("done_reason"),
+        "eval_count": data.get("eval_count"),
+        "eval_duration": data.get("eval_duration"),
+    }
+    if _return_inspect_thinking():
+        result["thinking"] = message.get("thinking")
+    if data.get("_thinking_retry"):
+        result["thinking_retry"] = data["_thinking_retry"]
+    return result
+
+
+@app.post("/ocr_image", operation_id="ocr_image")
+async def ocr_image(req: OcrImageRequest) -> dict[str, Any]:
+    """Extract text, bounding boxes, and confidence scores from a public image URL."""
+    image = await _fetch_pil_image(req.image_url)
+    result = _ocr_image_with_easyocr(req, image)
+    result["image_url"] = req.image_url
+    return result
 
 
 @app.post("/inspect_video", operation_id="inspect_video")
@@ -1053,9 +1360,10 @@ async def inspect_video(req: InspectVideoRequest) -> dict[str, Any]:
         images=frames,
         max_tokens=req.max_tokens,
         timeout_seconds=float(os.getenv("OLLAMA_VIDEO_TIMEOUT_SECONDS", "600")),
+        enable_thinking=req.enable_thinking,
     )
     message = data.get("message", {})
-    return {
+    result = {
         "backend": "ollama",
         "video_url": req.video_url,
         "video_metadata": video_metadata,
@@ -1063,8 +1371,12 @@ async def inspect_video(req: InspectVideoRequest) -> dict[str, Any]:
         "model": model,
         "sampled_frames": len(frames),
         "answer": message.get("content"),
-        "thinking": message.get("thinking"),
         "done_reason": data.get("done_reason"),
         "eval_count": data.get("eval_count"),
         "eval_duration": data.get("eval_duration"),
     }
+    if _return_inspect_thinking():
+        result["thinking"] = message.get("thinking")
+    if data.get("_thinking_retry"):
+        result["thinking_retry"] = data["_thinking_retry"]
+    return result
