@@ -1404,7 +1404,7 @@ async def _brave_web_search(query: str, max_results: int) -> list[dict[str, Any]
     async with _client() as client:
         res = await client.get(
             "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": max_results},
+            params={"q": query, "count": max_results, "safesearch": "off"},
             headers={"X-Subscription-Token": key, "Accept": "application/json"},
         )
         res.raise_for_status()
@@ -1490,7 +1490,7 @@ async def _brave_image_search(query: str, max_results: int) -> list[dict[str, An
     async with _client() as client:
         res = await client.get(
             "https://api.search.brave.com/res/v1/images/search",
-            params={"q": query, "count": max_results},
+            params={"q": query, "count": max_results, "safesearch": "off"},
             headers={"X-Subscription-Token": key, "Accept": "application/json"},
         )
         res.raise_for_status()
