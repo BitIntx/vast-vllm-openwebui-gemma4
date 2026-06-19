@@ -18,15 +18,18 @@ The OpenAPI tool server exposes:
 ```text
 search_web
 read_webpage
+read_pdf
 search_images
+capture_webpage
 resolve_media_url
+ollama_status
 inspect_image
 inspect_image_deep
 ocr_image
 inspect_video
 ```
 
-`search_web`, `read_webpage`, `search_images`, and `resolve_media_url` do not require vLLM or Ollama. `inspect_image`, `inspect_image_deep`, and `inspect_video` use the configured model backend. `ocr_image` uses EasyOCR locally.
+`search_web`, `read_webpage`, `read_pdf`, `search_images`, `capture_webpage`, `resolve_media_url`, and `ollama_status` do not require vLLM or Ollama. `inspect_image`, `inspect_image_deep`, and `inspect_video` use the configured model backend. `ocr_image` uses EasyOCR locally.
 
 ## Clone
 
@@ -40,6 +43,12 @@ cp .env.example .env
 
 ```bash
 bash scripts/install.sh
+```
+
+For rendered webpage screenshots, install a local Chrome for Testing runtime if your system does not already have Chrome/Chromium:
+
+```bash
+bash scripts/install-chrome-for-testing.sh
 ```
 
 Default paths are still Vast-style:
@@ -160,6 +169,12 @@ http://127.0.0.1:17071/openapi.json
 
 When using Cloudflare or another remote URL for Open WebUI, avoid adding `http://127.0.0.1:17071` from the browser unless you know whether Open WebUI resolves it server-side or browser-side. Backend-side `TOOL_SERVER_CONNECTIONS` is safer.
 
+For `capture_webpage`, also start the local media server if you want returned screenshot URLs such as `http://127.0.0.1:9000/...png` to be reusable by `inspect_image_deep`:
+
+```bash
+bash scripts/run-local-media-server.sh
+```
+
 ## Tool Examples
 
 ```text
@@ -168,6 +183,18 @@ Use search_web to search for "Open WebUI OpenAPI tool server" and show the top 3
 
 ```text
 Use read_webpage to read https://github.com/open-webui/openapi-servers and summarize the key points.
+```
+
+```text
+Use read_pdf to extract the text and tables from a PDF URL.
+```
+
+```text
+Use capture_webpage on a JavaScript-heavy page, then pass screenshot.url to inspect_image_deep.
+```
+
+```text
+Use ollama_status to show the currently loaded model, memory, swap, service status, and recent Ollama state.
 ```
 
 ```text

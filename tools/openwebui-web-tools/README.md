@@ -6,8 +6,11 @@ Tools:
 
 - `search_web`: web search using Brave if `BRAVE_SEARCH_API_KEY` is set, otherwise DuckDuckGo HTML.
 - `read_webpage`: fetches a webpage and returns readable title, metadata, text, and links.
+- `read_pdf`: fetches a PDF URL and returns extracted text, metadata, and simple tables.
 - `search_images`: image search using Brave, Tavily, then DuckDuckGo fallback.
+- `capture_webpage`: renders a webpage in headless Chrome and returns DOM text plus a reusable screenshot URL.
 - `resolve_media_url`: accepts a direct media URL or webpage URL and returns direct video/image/audio candidates when they are exposed in HTML/meta tags.
+- `ollama_status`: returns local Ollama/Open WebUI service status, loaded models, memory, swap, and process details.
 - `inspect_image`: inspects a public image URL using the configured backend.
 - `inspect_image_deep`: inspects a public image URL with one overview image plus zoomed crop tiles for small text and fine details.
 - `ocr_image`: extracts text, bounding boxes, and confidence scores from a public image URL using local EasyOCR.
@@ -30,6 +33,13 @@ export OLLAMA_INSPECT_ENABLE_THINKING=true
 export OLLAMA_INSPECT_RETURN_THINKING=false
 export OLLAMA_INSPECT_RETRY_WITHOUT_THINKING=true
 export OLLAMA_INSPECT_KEEP_ALIVE=1h
+export OPENWEBUI_TOOLS_MAX_PDF_MB=100
+export OPENWEBUI_CHROME_PATH="/path/to/chrome"
+export OPENWEBUI_CHROME_LIBRARY_PATH="$HOME/.local/chrome-libs/usr/lib/x86_64-linux-gnu"
+export OPENWEBUI_CHROME_RUNTIME_ROOT="$HOME/.local/chrome-libs"
+export LOCAL_MEDIA_HOST=127.0.0.1
+export LOCAL_MEDIA_PORT=9000
+export LOCAL_MEDIA_DIR="$HOME/.local/share/openwebui-media"
 
 # vLLM mode
 export TOOL_BACKEND=vllm
@@ -70,6 +80,18 @@ https://example.com/image.webp
 `resolve_media_url` can find simple `<video>`, `<source>`, `og:video`, `og:image`, and similar candidates from normal HTML pages. It does not download YouTube/TikTok/X players or run site JavaScript.
 
 Example prompts:
+
+```text
+Use ollama_status and show current loaded model, context, memory, swap, and service status.
+```
+
+```text
+Use read_pdf on this PDF URL and extract text and tables.
+```
+
+```text
+Use capture_webpage on this URL, then pass screenshot.url to inspect_image_deep for visual analysis.
+```
 
 ```text
 Use inspect_image_deep on this image URL and carefully read small labels, logos, and visible text.

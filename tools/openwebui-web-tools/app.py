@@ -2,9 +2,12 @@ import os
 import re
 import base64
 import io
+import json
+import time
 import subprocess
 import tempfile
 import urllib.parse
+import uuid
 from html.parser import HTMLParser
 from html import unescape
 from pathlib import Path
@@ -23,9 +26,12 @@ APP_TITLE = "Open WebUI Web + Image + Video Tools"
 DEFAULT_MODEL = "AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4"
 DEFAULT_OLLAMA_INSPECT_MODEL = "tinyrick/Qwen3.6-35B-A3B-uncensored-heretic-vision-llmfan46:Q4_K_M-cpu4"
 WEB_ONLY_TOOL_PATHS = {
+    "/ollama_status",
     "/search_web",
     "/read_webpage",
+    "/read_pdf",
     "/search_images",
+    "/capture_webpage",
     "/resolve_media_url",
 }
 INSPECT_TOOL_PATHS = {
@@ -112,6 +118,39 @@ class ImageSearchRequest(BaseModel):
 class ReadWebpageRequest(BaseModel):
     url: str = Field(..., description="HTTP(S) webpage URL to fetch and summarize as text.")
     max_chars: int = Field(12000, ge=1000, le=50000, description="Maximum extracted text characters to return.")
+
+
+class OllamaStatusRequest(BaseModel):
+    include_logs: bool = Field(False, description="Include recent user-systemd logs for Ollama and related services.")
+    log_lines: int = Field(80, ge=10, le=300, description="Maximum log lines per service when include_logs is true.")
+    include_processes: bool = Field(True, description="Include local process memory/CPU details for Ollama-related processes.")
+
+
+class ReadPdfRequest(BaseModel):
+    url: str = Field(..., description="HTTP(S) PDF URL to fetch and extract.")
+    max_pages: int = Field(20, ge=1, le=200, description="Maximum PDF pages to inspect.")
+    max_chars: int = Field(50000, ge=1000, le=200000, description="Maximum extracted text characters to return.")
+    password: str | None = Field(None, description="Optional PDF password.")
+    extract_tables: bool = Field(True, description="Try to extract simple tables with PyMuPDF.")
+    max_tables: int = Field(10, ge=0, le=50, description="Maximum tables to return.")
+    max_table_rows: int = Field(40, ge=1, le=200, description="Maximum rows per extracted table.")
+    ocr_if_no_text: bool = Field(False, description="Run EasyOCR on pages with little or no embedded text.")
+    ocr_languages: list[str] = Field(default_factory=lambda: ["ko", "en"], description="EasyOCR languages used when OCR fallback is enabled.")
+    ocr_max_pages: int = Field(3, ge=1, le=20, description="Maximum pages to OCR when OCR fallback is enabled.")
+    ocr_dpi: int = Field(144, ge=72, le=240, description="Render DPI for OCR fallback.")
+
+
+class CaptureWebpageRequest(BaseModel):
+    url: str = Field(..., description="HTTP(S) webpage URL to render in a headless browser.")
+    wait_until: str = Field("networkidle", pattern="^(load|domcontentloaded|networkidle)$", description="Page load state to wait for.")
+    wait_ms: int = Field(1000, ge=0, le=10000, description="Extra milliseconds to wait after the load state.")
+    timeout_ms: int = Field(45000, ge=5000, le=120000, description="Browser navigation timeout.")
+    viewport_width: int = Field(1365, ge=320, le=3840, description="Browser viewport width.")
+    viewport_height: int = Field(900, ge=240, le=2160, description="Browser viewport height.")
+    full_page: bool = Field(False, description="Capture the full scrollable page instead of just the viewport.")
+    max_text_chars: int = Field(20000, ge=1000, le=100000, description="Maximum rendered body text characters to return.")
+    screenshot_max_side: int = Field(1800, ge=512, le=4096, description="Resize screenshot so its longest side is at most this many pixels.")
+    include_screenshot_base64: bool = Field(False, description="Also return screenshot as a base64 data URL. This can make tool output large.")
 
 
 class ResolveMediaUrlRequest(BaseModel):
@@ -234,8 +273,364 @@ def _max_video_bytes() -> int:
     return int(os.getenv("OLLAMA_INSPECT_MAX_VIDEO_MB", "200")) * 1024 * 1024
 
 
+def _max_pdf_bytes() -> int:
+    return int(os.getenv("OPENWEBUI_TOOLS_MAX_PDF_MB", "100")) * 1024 * 1024
+
+
 def _return_inspect_thinking() -> bool:
     return _env_bool("OLLAMA_INSPECT_RETURN_THINKING", "false")
+
+
+def _run_local_command(cmd: list[str], timeout: float = 5.0) -> dict[str, Any]:
+    try:
+        result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "stdout": "", "stderr": ""}
+    return {
+        "ok": result.returncode == 0,
+        "returncode": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+
+
+def _systemctl_user_value(*args: str, timeout: float = 5.0) -> str | None:
+    result = _run_local_command(["systemctl", "--user", *args], timeout=timeout)
+    if not result["ok"]:
+        return None
+    return result["stdout"]
+
+
+def _journalctl_user(service: str, lines: int) -> str:
+    result = _run_local_command(
+        ["journalctl", "--user", "-u", service, "--no-pager", "-n", str(lines)],
+        timeout=8.0,
+    )
+    if result["ok"]:
+        return result["stdout"]
+    return result["stderr"] or result["stdout"]
+
+
+def _bytes_summary(value: int | float | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    number = float(value)
+    return {
+        "bytes": int(number),
+        "gib": round(number / 1024 / 1024 / 1024, 3),
+    }
+
+
+def _ollama_related_processes() -> list[dict[str, Any]]:
+    try:
+        import psutil
+    except Exception:
+        return []
+
+    processes: list[dict[str, Any]] = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline", "memory_info", "cpu_percent", "create_time", "status"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            joined = " ".join(cmdline)
+            name = proc.info.get("name") or ""
+            if "ollama" not in name.lower() and "ollama" not in joined.lower():
+                continue
+            mem = proc.info.get("memory_info")
+            processes.append(
+                {
+                    "pid": proc.info["pid"],
+                    "name": name,
+                    "cmdline": cmdline,
+                    "status": proc.info.get("status"),
+                    "rss": _bytes_summary(getattr(mem, "rss", None)),
+                    "vms": _bytes_summary(getattr(mem, "vms", None)),
+                    "cpu_percent_last_interval": proc.info.get("cpu_percent"),
+                    "create_time": proc.info.get("create_time"),
+                }
+            )
+        except Exception:
+            continue
+    return processes
+
+
+def _local_media_dir() -> Path:
+    configured = os.getenv("LOCAL_MEDIA_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "share" / "openwebui-web-tools" / "media"
+
+
+def _local_media_url(filename: str) -> str:
+    host = os.getenv("LOCAL_MEDIA_HOST", "127.0.0.1")
+    port = os.getenv("LOCAL_MEDIA_PORT", "9000")
+    return f"http://{host}:{port}/{urllib.parse.quote(filename)}"
+
+
+def _save_local_media(content: bytes, suffix: str) -> dict[str, str]:
+    media_dir = _local_media_dir()
+    media_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{int(time.time())}-{uuid.uuid4().hex}{suffix}"
+    path = media_dir / filename
+    path.write_bytes(content)
+    return {"path": str(path), "url": _local_media_url(filename), "filename": filename}
+
+
+def _chrome_executable_path() -> str | None:
+    configured = os.getenv("OPENWEBUI_CHROME_PATH")
+    if configured and Path(configured).exists():
+        return configured
+
+    cache_root = Path.home() / ".cache" / "openwebui-web-tools" / "chrome-for-testing"
+    if cache_root.exists():
+        candidates = sorted(cache_root.glob("*/chrome-linux64/chrome"), reverse=True)
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+
+    for candidate in (
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _chrome_library_path() -> str | None:
+    configured = os.getenv("OPENWEBUI_CHROME_LIBRARY_PATH")
+    if configured:
+        return configured
+    default = Path.home() / ".local" / "chrome-libs" / "usr" / "lib" / "x86_64-linux-gnu"
+    return str(default) if default.exists() else None
+
+
+def _chrome_runtime_root() -> Path:
+    return Path(os.getenv("OPENWEBUI_CHROME_RUNTIME_ROOT", str(Path.home() / ".local" / "chrome-libs"))).expanduser()
+
+
+def _apply_chrome_runtime_env(browser_env: dict[str, str]) -> None:
+    lib_path = _chrome_library_path()
+    if lib_path:
+        browser_env["LD_LIBRARY_PATH"] = lib_path + (":" + browser_env["LD_LIBRARY_PATH"] if browser_env.get("LD_LIBRARY_PATH") else "")
+
+    runtime_root = _chrome_runtime_root()
+    fonts_conf = runtime_root / "etc" / "fonts" / "fonts.conf"
+    if fonts_conf.exists():
+        browser_env.setdefault("FONTCONFIG_PATH", str(fonts_conf.parent))
+        browser_env.setdefault("FONTCONFIG_FILE", str(fonts_conf))
+        browser_env.setdefault("FONTCONFIG_SYSROOT", str(runtime_root))
+        xdg_share = str(runtime_root / "usr" / "share")
+        browser_env["XDG_DATA_DIRS"] = xdg_share + (":" + browser_env["XDG_DATA_DIRS"] if browser_env.get("XDG_DATA_DIRS") else ":/usr/local/share:/usr/share")
+
+
+def _compress_screenshot(png_bytes: bytes, max_side: int) -> tuple[bytes, dict[str, int]]:
+    image = Image.open(io.BytesIO(png_bytes))
+    original = {"width": image.width, "height": image.height}
+    image.thumbnail((max_side, max_side))
+    if image.mode not in {"RGB", "L"}:
+        image = image.convert("RGB")
+    out = io.BytesIO()
+    image.save(out, format="PNG", optimize=True)
+    return out.getvalue(), {"original_width": original["width"], "original_height": original["height"], "width": image.width, "height": image.height}
+
+
+async def _fetch_pdf_content(url: str) -> tuple[bytes, str, str]:
+    _require_http_url(url)
+    try:
+        async with _client() as client:
+            res = await client.get(url, timeout=httpx.Timeout(120.0, connect=10.0))
+            res.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=400, detail=f"PDF fetch failed: HTTP {exc.response.status_code}: {exc.response.text[:300]}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"PDF fetch failed: {exc}") from exc
+
+    content = res.content
+    if len(content) > _max_pdf_bytes():
+        raise HTTPException(status_code=413, detail=f"PDF is larger than {_max_pdf_bytes() // 1024 // 1024} MB")
+    content_type = res.headers.get("content-type", "").split(";", 1)[0].lower()
+    if content_type and "pdf" not in content_type and not content.lstrip().startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail=f"url must return PDF content. Got {content_type}")
+    return content, str(res.url), content_type
+
+
+def _extract_pdf(content: bytes, source_url: str, content_type: str, req: ReadPdfRequest) -> dict[str, Any]:
+    try:
+        import fitz
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"PyMuPDF is not installed or failed to import: {exc}") from exc
+
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"PDF could not be opened: {exc}") from exc
+
+    try:
+        if doc.needs_pass:
+            if not req.password or not doc.authenticate(req.password):
+                raise HTTPException(status_code=401, detail="PDF requires a valid password")
+
+        metadata = {key: value for key, value in (doc.metadata or {}).items() if value}
+        max_pages = min(req.max_pages, doc.page_count)
+        remaining_chars = req.max_chars
+        pages: list[dict[str, Any]] = []
+        tables: list[dict[str, Any]] = []
+        ocr_pages_used = 0
+        truncated = False
+
+        for page_index in range(max_pages):
+            if remaining_chars <= 0:
+                truncated = True
+                break
+            page = doc.load_page(page_index)
+            text = page.get_text("text") or ""
+            ocr_used = False
+            ocr_line_count = 0
+
+            if req.ocr_if_no_text and len(text.strip()) < 40 and ocr_pages_used < req.ocr_max_pages:
+                zoom = req.ocr_dpi / 72
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                image = Image.open(io.BytesIO(pix.tobytes("png")))
+                ocr_req = OcrImageRequest(
+                    image_url=source_url,
+                    languages=req.ocr_languages,
+                    max_image_side=3072,
+                    paragraph=False,
+                    max_results=120,
+                )
+                ocr_result = _ocr_image_with_easyocr(ocr_req, image)
+                if ocr_result["text"].strip():
+                    text = ocr_result["text"]
+                    ocr_used = True
+                    ocr_line_count = ocr_result["line_count"]
+                    ocr_pages_used += 1
+
+            page_text = _normalize_text(text)
+            if len(page_text) > remaining_chars:
+                page_text = page_text[:remaining_chars].rstrip() + "\n...[truncated]"
+                truncated = True
+                remaining_chars = 0
+            else:
+                remaining_chars -= len(page_text)
+
+            pages.append(
+                {
+                    "page": page_index + 1,
+                    "text": page_text,
+                    "char_count": len(page_text),
+                    "ocr_used": ocr_used,
+                    "ocr_line_count": ocr_line_count,
+                }
+            )
+
+            if req.extract_tables and len(tables) < req.max_tables:
+                try:
+                    found = page.find_tables()
+                    for table_index, table in enumerate(getattr(found, "tables", []) or []):
+                        if len(tables) >= req.max_tables:
+                            break
+                        rows = table.extract()[: req.max_table_rows]
+                        tables.append(
+                            {
+                                "page": page_index + 1,
+                                "table": table_index + 1,
+                                "row_count_returned": len(rows),
+                                "rows": rows,
+                            }
+                        )
+                except Exception:
+                    pass
+
+        joined_text = "\n\n".join(f"[Page {page['page']}]\n{page['text']}" for page in pages if page["text"])
+        return {
+            "url": source_url,
+            "content_type": content_type,
+            "page_count": doc.page_count,
+            "pages_returned": len(pages),
+            "metadata": metadata,
+            "text": joined_text,
+            "pages": pages,
+            "tables": tables,
+            "truncated": truncated or max_pages < doc.page_count,
+            "ocr_pages_used": ocr_pages_used,
+        }
+    finally:
+        doc.close()
+
+
+async def _capture_webpage(req: CaptureWebpageRequest) -> dict[str, Any]:
+    _require_http_url(req.url)
+    chrome_path = _chrome_executable_path()
+    if not chrome_path:
+        raise HTTPException(
+            status_code=503,
+            detail="No Chrome/Chromium executable found. Set OPENWEBUI_CHROME_PATH or install a browser.",
+        )
+
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Playwright is not installed or failed to import: {exc}") from exc
+
+    browser_env = dict(os.environ)
+    _apply_chrome_runtime_env(browser_env)
+
+    async with async_playwright() as playwright:
+        try:
+            browser = await playwright.chromium.launch(
+                executable_path=chrome_path,
+                headless=True,
+                env=browser_env,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-crash-reporter",
+                ],
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Headless browser failed to launch: {exc}") from exc
+
+        try:
+            page = await browser.new_page(viewport={"width": req.viewport_width, "height": req.viewport_height})
+            response = await page.goto(req.url, wait_until=req.wait_until, timeout=req.timeout_ms)
+            if req.wait_ms:
+                await page.wait_for_timeout(req.wait_ms)
+            title = await page.title()
+            final_url = page.url
+            body_text = await page.evaluate("() => document.body ? (document.body.innerText || document.body.textContent || '') : ''")
+            page_size = await page.evaluate(
+                "() => ({width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight})"
+            )
+            screenshot = await page.screenshot(full_page=req.full_page, type="png")
+        finally:
+            await browser.close()
+
+    screenshot, screenshot_size = _compress_screenshot(screenshot, req.screenshot_max_side)
+    saved = _save_local_media(screenshot, ".png")
+    result = {
+        "url": req.url,
+        "final_url": final_url,
+        "status_code": response.status if response else None,
+        "title": title,
+        "viewport": {"width": req.viewport_width, "height": req.viewport_height},
+        "page_size": page_size,
+        "screenshot": {
+            "url": saved["url"],
+            "path": saved["path"],
+            "filename": saved["filename"],
+            **screenshot_size,
+        },
+        "text": _normalize_text(body_text, req.max_text_chars),
+        "text_truncated": len(_normalize_text(body_text)) > req.max_text_chars,
+        "next_tool": "inspect_image_deep",
+        "note": "Pass screenshot.url to inspect_image_deep when visual analysis of the rendered page is needed.",
+    }
+    if req.include_screenshot_base64:
+        result["screenshot"]["data_url"] = "data:image/png;base64," + base64.b64encode(screenshot).decode("ascii")
+    return result
 
 
 _EASYOCR_READERS: dict[tuple[str, ...], Any] = {}
@@ -1165,12 +1560,96 @@ async def root() -> dict[str, Any]:
         "status": "ok",
         "openapi_url": "/openapi.json",
         "tools": [
+            "ollama_status",
             "search_web",
             "read_webpage",
+            "read_pdf",
             "search_images",
+            "capture_webpage",
             "resolve_media_url",
         ]
         + (["inspect_image", "inspect_image_deep", "ocr_image", "inspect_video"] if _inspect_tools_enabled() else []),
+    }
+
+
+@app.post("/ollama_status", operation_id="ollama_status")
+async def ollama_status(req: OllamaStatusRequest) -> dict[str, Any]:
+    """Return local Ollama, Open WebUI tool server, memory, swap, and model status."""
+    api: dict[str, Any] = {}
+    for name, path in {
+        "version": "/api/version",
+        "running_models": "/api/ps",
+        "installed_models": "/api/tags",
+    }.items():
+        try:
+            async with _client() as client:
+                res = await client.get(f"{_ollama_base_url()}{path}", timeout=httpx.Timeout(10.0, connect=3.0))
+                res.raise_for_status()
+            api[name] = res.json()
+        except Exception as exc:
+            api[name] = {"error": str(exc)}
+
+    services = [
+        "ollama.service",
+        "ollama-context-proxy.service",
+        "open-webui.service",
+        "openwebui-web-tools.service",
+        "cloudflared-open-webui.service",
+        "local-media-server.service",
+    ]
+    service_status: dict[str, Any] = {}
+    for service in services:
+        service_status[service] = {
+            "active": _systemctl_user_value("is-active", service),
+            "enabled": _systemctl_user_value("is-enabled", service),
+        }
+        env_value = _systemctl_user_value("show", service, "-p", "Environment", "--value")
+        if env_value:
+            service_status[service]["environment"] = env_value
+        if req.include_logs:
+            service_status[service]["recent_logs"] = _journalctl_user(service, req.log_lines)
+
+    system: dict[str, Any] = {}
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        root_disk = psutil.disk_usage("/")
+        system = {
+            "cpu_count_logical": psutil.cpu_count(logical=True),
+            "cpu_count_physical": psutil.cpu_count(logical=False),
+            "load_avg": os.getloadavg() if hasattr(os, "getloadavg") else None,
+            "cpu_percent": psutil.cpu_percent(interval=0.1),
+            "memory": {
+                "total": _bytes_summary(vm.total),
+                "available": _bytes_summary(vm.available),
+                "used": _bytes_summary(vm.used),
+                "percent": vm.percent,
+            },
+            "swap": {
+                "total": _bytes_summary(swap.total),
+                "used": _bytes_summary(swap.used),
+                "free": _bytes_summary(swap.free),
+                "percent": swap.percent,
+            },
+            "root_disk": {
+                "total": _bytes_summary(root_disk.total),
+                "used": _bytes_summary(root_disk.used),
+                "free": _bytes_summary(root_disk.free),
+                "percent": root_disk.percent,
+            },
+        }
+    except Exception as exc:
+        system = {"error": str(exc)}
+
+    return {
+        "ollama_base_url": _ollama_base_url(),
+        "tool_backend": _tool_backend(),
+        "api": api,
+        "services": service_status,
+        "system": system,
+        "processes": _ollama_related_processes() if req.include_processes else [],
     }
 
 
@@ -1197,6 +1676,18 @@ async def read_webpage(req: ReadWebpageRequest) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"webpage read failed: {exc}") from exc
 
 
+@app.post("/read_pdf", operation_id="read_pdf")
+async def read_pdf(req: ReadPdfRequest) -> dict[str, Any]:
+    """Fetch a PDF URL and return extracted text, metadata, and simple tables."""
+    content, final_url, content_type = await _fetch_pdf_content(req.url)
+    try:
+        return _extract_pdf(content, final_url, content_type, req)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"PDF extraction failed: {exc}") from exc
+
+
 @app.post("/search_images", operation_id="search_images")
 async def search_images(req: ImageSearchRequest) -> dict[str, Any]:
     """Search images and return image URLs, thumbnails, and source pages."""
@@ -1209,6 +1700,17 @@ async def search_images(req: ImageSearchRequest) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"image search failed: {exc}") from exc
     return {"query": req.query, "results": results}
+
+
+@app.post("/capture_webpage", operation_id="capture_webpage")
+async def capture_webpage(req: CaptureWebpageRequest) -> dict[str, Any]:
+    """Render a webpage in a headless browser and return text plus a screenshot URL."""
+    try:
+        return await _capture_webpage(req)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"webpage capture failed: {exc}") from exc
 
 
 @app.post("/resolve_media_url", operation_id="resolve_media_url")
